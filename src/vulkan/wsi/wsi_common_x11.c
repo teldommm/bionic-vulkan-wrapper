@@ -2327,6 +2327,40 @@ x11_get_min_image_count_for_present_mode(struct wsi_device *wsi_device,
  * Supports immediate, fifo and mailbox presentation mode.
  *
  */
+/* Winlator/WinLite HUD: mark the swapchain window so the X server can find
+ * the game window and show renderer/GPU names (same as the GameNative wrapper). */
+static void
+x11_set_string_property(xcb_connection_t *conn, xcb_window_t window,
+                        const char *name, const char *value)
+{
+   if (!value)
+      value = "";
+   xcb_intern_atom_cookie_t atom_cookie = xcb_intern_atom(conn, 0, strlen(name), name);
+   xcb_intern_atom_reply_t *atom_reply = xcb_intern_atom_reply(conn, atom_cookie, NULL);
+   if (atom_reply) {
+      xcb_change_property(conn, XCB_PROP_MODE_REPLACE, window, atom_reply->atom,
+                          XCB_ATOM_STRING, 8, strlen(value), value);
+      xcb_flush(conn);
+      free(atom_reply);
+   }
+}
+
+static void
+x11_set_mesa_drv_properties(xcb_connection_t *conn, xcb_window_t window,
+                            struct wsi_device *wsi_device)
+{
+   VK_FROM_HANDLE(vk_physical_device, pdev, wsi_device->pdevice);
+   const char *engine = (pdev && pdev->instance && pdev->instance->app_info.engine_name)
+      ? pdev->instance->app_info.engine_name : "wrapper";
+   VkPhysicalDeviceProperties props = {0};
+   if (pdev && pdev->dispatch_table.GetPhysicalDeviceProperties)
+      pdev->dispatch_table.GetPhysicalDeviceProperties(wsi_device->pdevice, &props);
+
+   x11_set_string_property(conn, window, "_MESA_DRV", "0");
+   x11_set_string_property(conn, window, "_MESA_DRV_ENGINE_NAME", engine);
+   x11_set_string_property(conn, window, "_MESA_DRV_GPU_NAME", props.deviceName);
+}
+
 static VkResult
 x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
                              VkDevice device,
@@ -2582,6 +2616,8 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    }
 
    assert(chain->has_present_queue || !chain->has_acquire_queue);
+
+   x11_set_mesa_drv_properties(conn, window, wsi_device);
 
    *swapchain_out = &chain->base;
    return VK_SUCCESS;
