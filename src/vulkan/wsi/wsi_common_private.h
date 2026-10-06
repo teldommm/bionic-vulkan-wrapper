@@ -594,15 +594,6 @@ void wsi_headless_finish_wsi(struct wsi_device *wsi_device,
 VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_swapchain, base, VkSwapchainKHR,
                                VK_OBJECT_TYPE_SWAPCHAIN_KHR)
 
-/* This should be static inline here since this can be called by runtime,
- * and we cannot create cyclic dependencies. */
-static inline VkTimeDomainKHR
-wsi_common_get_time_domain(VkSwapchainKHR _swapchain,
-                           VkPresentStageFlagBitsEXT stage,
-                           uint64_t time_domain_id)
-{
-   VK_FROM_HANDLE(wsi_swapchain, swapchain, _swapchain);
-
 #ifdef __TERMUX__
 enum wsi_swapchain_blit_type
 wsi_get_android_blit_type(const struct wsi_device *wsi,
@@ -615,6 +606,16 @@ wsi_configure_android_image(const struct wsi_swapchain *chain,
                             const struct wsi_base_image_params *params,
                             struct wsi_image_info *info);
 #endif
+
+/* This should be static inline here since this can be called by runtime,
+ * and we cannot create cyclic dependencies. */
+static inline VkTimeDomainKHR
+wsi_common_get_time_domain(VkSwapchainKHR _swapchain,
+                           VkPresentStageFlagBitsEXT stage,
+                           uint64_t time_domain_id)
+{
+   VK_FROM_HANDLE(wsi_swapchain, swapchain, _swapchain);
+
    return stage == VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT &&
           swapchain->wsi->timestamp_bits == 64
              ? VK_TIME_DOMAIN_DEVICE_KHR
