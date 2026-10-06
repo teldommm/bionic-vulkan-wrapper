@@ -262,6 +262,10 @@ wsi_create_ahardware_buffer_blit_context(const struct wsi_swapchain *chain,
 inline static uint32_t
 to_ahardware_buffer_format(VkFormat format) {
    switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      /* WRAPPER_SURFACE_FORMAT=rgba8 swapchains */
+      return AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
    case VK_FORMAT_B8G8R8A8_SRGB:
    case VK_FORMAT_B8G8R8A8_UNORM:
       return AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
