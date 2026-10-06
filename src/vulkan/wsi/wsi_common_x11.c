@@ -595,8 +595,21 @@ x11_surface_get_capabilities(VkIcdSurfaceBase *icd_surface,
       }
    }
 
-   /* There is no real maximum */
-   caps->maxImageCount = 0;
+   /* Wrapper: WRAPPER_MAX_IMAGE_COUNT pins the swapchain length (the
+    * emulator sets 1 for its "immediate" present mode). */
+   static int wrapper_max_image_count = -1;
+   if (wrapper_max_image_count == -1) {
+      const char *env = getenv("WRAPPER_MAX_IMAGE_COUNT");
+      wrapper_max_image_count = env ? atoi(env) : 0;
+   }
+
+   if (wrapper_max_image_count > 0) {
+      caps->minImageCount = wrapper_max_image_count;
+      caps->maxImageCount = wrapper_max_image_count;
+   } else {
+      /* There is no real maximum */
+      caps->maxImageCount = 0;
+   }
 
    caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
    caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
@@ -715,7 +728,42 @@ get_sorted_vk_formats(VkIcdSurfaceBase *surface, struct wsi_device *wsi_device,
 next_format:;
    }
 
-   if (wsi_device->force_bgra8_unorm_first) {
+   /* Wrapper: the software and blit paths always produce BGRA. */
+   bool force_bgra8 = wsi_device->force_bgra8_unorm_first;
+   bool force_rgba8 = wsi_device->force_rgba8_unorm_first;
+   if (wsi_device->sw || wsi_device->needs_blit) {
+      force_bgra8 = true;
+      force_rgba8 = false;
+   }
+
+   if (force_rgba8) {
+      /* The X server drawable is RGBA (HAL_PIXEL_FORMAT_RGBA_8888): hand out
+       * RGBA formats only, otherwise the application may still pick BGRA and
+       * red/blue end up swapped. */
+      for (unsigned i = 0; i < *count; i++) {
+         if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_UNORM)
+            sorted_formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
+         else if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_SRGB)
+            sorted_formats[i] = VK_FORMAT_R8G8B8A8_SRGB;
+      }
+      /* drop duplicates introduced above */
+      unsigned out = 0;
+      for (unsigned i = 0; i < *count; i++) {
+         bool dup = false;
+         for (unsigned j = 0; j < out; j++)
+            dup |= sorted_formats[j] == sorted_formats[i];
+         if (!dup)
+            sorted_formats[out++] = sorted_formats[i];
+      }
+      *count = out;
+      for (unsigned i = 0; i < *count; i++) {
+         if (sorted_formats[i] == VK_FORMAT_R8G8B8A8_UNORM) {
+            sorted_formats[i] = sorted_formats[0];
+            sorted_formats[0] = VK_FORMAT_R8G8B8A8_UNORM;
+            break;
+         }
+      }
+   } else if (force_bgra8) {
       for (unsigned i = 0; i < *count; i++) {
          if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_UNORM) {
             sorted_formats[i] = sorted_formats[0];

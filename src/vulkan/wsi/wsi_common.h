@@ -127,6 +127,8 @@ struct wsi_device {
    uint32_t optimalBufferCopyRowPitchAlignment;
    VkPresentModeKHR override_present_mode;
    bool force_bgra8_unorm_first;
+   /* Wrapper: put RGBA8 first (WRAPPER_SURFACE_FORMAT=rgba8 / Mali) */
+   bool force_rgba8_unorm_first;
 
    /* Whether to enable adaptive sync for a swapchain if implemented and
     * available. Not all window systems might support this. */

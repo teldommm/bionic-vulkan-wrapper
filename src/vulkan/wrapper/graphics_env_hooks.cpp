@@ -3,13 +3,23 @@
 #include <vector>
 #include <string>
 #include <dlfcn.h>
+#include <cstdlib>
 
 extern "C" {
 #include "wrapper_log.h"
 #include "wrapper_debug.h"
 }
 
-#define PATH "/data/data/com.winlator.cmod/files/imagefs/usr/lib:/data/data/com.micewine.emu/files/usr/lib:/data/local/tmp"
+#define DEFAULT_PATH "/data/data/com.winlator.cmod/files/imagefs/usr/lib:/data/data/com.micewine.emu/files/usr/lib:/data/local/tmp"
+
+/* The emulator exports WRAPPER_LAYER_PATH=<imagefs>/usr/lib, which keeps
+ * working after an applicationId change (com.winlite.*). */
+static std::string layer_path() {
+    const char* env = getenv("WRAPPER_LAYER_PATH");
+    if (env && *env)
+        return std::string(env) + ":" + DEFAULT_PATH;
+    return DEFAULT_PATH;
+}
 
 extern "C"
 bool set_layer_paths() {
@@ -46,6 +56,8 @@ bool set_layer_paths() {
     if (!setLayerPaths && !setLayerPaths2) {
         LAYER_ERROR("Could not find android::GraphicsEnv::setLayerPaths(android::NativeLoaderNamespace*, const std::string[&])");
     }
+
+    const std::string PATH = layer_path();
 
     void* instance = getInstance();
     if (!instance) {

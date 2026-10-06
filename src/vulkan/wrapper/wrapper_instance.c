@@ -59,6 +59,7 @@ static void *get_vulkan_handle_icd()
 {
    char *path = getenv("ADRENOTOOLS_DRIVER_PATH");
    char *name = getenv("ADRENOTOOLS_DRIVER_NAME");
+   char *redirect_dir = getenv("ADRENOTOOLS_REDIRECT_DIR");
    char *hooks = getenv("ADRENOTOOLS_HOOKS_PATH");
 #ifdef __TERMUX__
    if (!hooks)
@@ -76,7 +77,20 @@ static void *get_vulkan_handle_icd()
       char *temp;
       asprintf(&temp, "%s%s", path, "temp");
       mkdir(temp, S_IRWXU | S_IRWXG);
-      return  adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, temp, hooks, path, name, NULL, NULL);
+      /* File redirection lets the Qualcomm driver pick up qgl_config.txt
+       * (and its shader cache) from a writable directory. */
+      int flags = ADRENOTOOLS_DRIVER_CUSTOM;
+      if (redirect_dir && *redirect_dir) {
+         WLOG("get_vulkan_handle: redirecting driver files to %s", redirect_dir);
+         flags |= ADRENOTOOLS_DRIVER_FILE_REDIRECT;
+      } else {
+         redirect_dir = NULL;
+      }
+      void *handle = adrenotools_open_libvulkan(RTLD_NOW, flags, temp, hooks, path, name, redirect_dir, NULL);
+      if (handle)
+         return handle;
+      WLOGE("adrenotools_open_libvulkan failed for %s/%s, falling back to %s", path, name, DEFAULT_VULKAN_PATH);
+      return dlopen(DEFAULT_VULKAN_PATH, RTLD_NOW | RTLD_LOCAL);
    } else  {
       WLOG("get_vulkan_handle: defaulting to %s", DEFAULT_VULKAN_PATH);
       return dlopen(DEFAULT_VULKAN_PATH, RTLD_NOW | RTLD_LOCAL);
@@ -272,7 +286,10 @@ WRAPPER_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    instance->vk.physical_devices.enumerate = enumerate_physical_device;
    instance->vk.physical_devices.destroy = destroy_physical_device;
 
-   for (int idx = 0; idx < pCreateInfo->enabledExtensionCount; idx++) {
+   /* Walk the whole extension table: the app's enabled list is unrelated to
+    * the table index, iterating enabledExtensionCount silently dropped every
+    * instance extension past that count. */
+   for (int idx = 0; idx < VK_INSTANCE_EXTENSION_COUNT; idx++) {
       if (wrapper_instance_extensions.extensions[idx])
          continue;
 
@@ -379,13 +396,13 @@ WRAPPER_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       _vkEnumerateInstanceLayerProperties(&layerCount, NULL);
 
       if (layerCount == 0) {
-         WLOGE("No layers found, make sure that /data/data/com.winlator.cmod/files/imagefs/usr/lib/libVkLayer_khronos_validation.so exists");
+         WLOGE("No layers found, make sure libVkLayer_khronos_validation.so exists in WRAPPER_LAYER_PATH");
          return vk_error(NULL, VK_ERROR_LAYER_NOT_PRESENT);
       } else {
          VkLayerProperties availableLayers[layerCount];
          _vkEnumerateInstanceLayerProperties(&layerCount, availableLayers);
 
-         WLOGD("Found %d layers in /data/data/com.winlator.cmod/files/imagefs/usr/lib/", layerCount);
+         WLOGD("Found %d layers", layerCount);
          for (int i = 0; i < layerCount; i++) {
             WLOGD("    Layer[%d]: %s", i, availableLayers[i].layerName);
          }

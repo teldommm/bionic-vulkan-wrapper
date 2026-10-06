@@ -9,9 +9,24 @@ bool check_flag(const char* env, bool default_value);
 #define CHECK_FLAG(name) ({ \
     static bool __value; \
     static bool __initialized; \
-    if (!__initialized) \
+    if (!__initialized) { \
         __value = check_flag(name, false); \
+        __initialized = true; \
+    } \
     __value; \
+})
+
+/* Integer environment option, parsed once per call site. */
+int wrapper_env_int(const char* env, int default_value);
+
+#define ENV_INT(name, def) ({ \
+    static int __ivalue; \
+    static bool __iinitialized; \
+    if (!__iinitialized) { \
+        __ivalue = wrapper_env_int(name, def); \
+        __iinitialized = true; \
+    } \
+    __ivalue; \
 })
 
 uint32_t make_bcn_masks(const char* flag);

@@ -120,7 +120,10 @@ int should_log() {
         __log_level = LOG_LEVEL_NONE;
     }
 
-    if (__log_level != LOG_LEVEL_NONE) {
+    /* Without an explicit WRAPPER_LOG_LEVEL only report errors to logcat:
+     * opening a file on /sdcard for every launched process is costly and
+     * fails without storage permission anyway. */
+    if (log_level && __log_level != LOG_LEVEL_NONE) {
         __log_fd = open_log_file("wrapper_log");
         // If __log_fd failed to open, still log to logcat
         if (!__log_fd) {

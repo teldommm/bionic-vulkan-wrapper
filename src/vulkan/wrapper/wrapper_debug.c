@@ -15,6 +15,15 @@ bool check_flag(const char* env, bool default_value) {
    }
 }
 
+int wrapper_env_int(const char* env, int default_value) {
+   const char* value = getenv(env);
+   if (!value || !*value) return default_value;
+   char* end = NULL;
+   long v = strtol(value, &end, 0);
+   if (end == value) return default_value;
+   return (int) v;
+}
+
 uint32_t make_bcn_masks(const char* flag) {
     uint32_t mask = 0;
     const char* mask_bcn = getenv(flag);

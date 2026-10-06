@@ -124,6 +124,7 @@ wrapper_files = files(
   'graphics_env_hooks.cpp',
   'artifacts.cpp',
   'bcdec.c',
+  'wrapper_xfb.c',
 )
 
 wrapper_deps = [

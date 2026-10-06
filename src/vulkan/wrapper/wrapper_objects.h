@@ -46,6 +46,12 @@ struct wrapper_physical_device {
    VkFormatProperties bc4_format_properties;
    bool needs_bc1_emulation;
    bool needs_bc4_emulation;
+   /* Runtime options (mostly set by the emulator through WRAPPER_* env vars) */
+   const char *resource_type;        /* WRAPPER_RESOURCE_TYPE: auto|dmabuf|dmaheap|ahb|opaque */
+   bool disable_placed;              /* WRAPPER_DISABLE_PLACED */
+   uint32_t api_version_override;    /* WRAPPER_VK_VERSION */
+   bool is_dxvk;
+   bool is_qcom;
    struct wsi_device wsi_device;
    struct wrapper_instance *instance;
    struct vk_features base_supported_features;
@@ -94,6 +100,8 @@ struct wrapper_device {
     struct hash_table_u64* image_map;
     struct hash_table_u64* buffer_map;
     struct hash_table_u64* command_pool_map;
+    struct hash_table_u64* memory_map; /* VkDeviceMemory -> emulated wrapper_device_memory */
+    struct hash_table_u64* fake_xfb_query_pools; /* VkQueryPool -> (void*)1 when xfb is faked */
 
     struct wrapper_physical_device *physical;
     struct vk_device_dispatch_table dispatch_table;
@@ -105,7 +113,8 @@ struct wrapper_device {
 
     VkCommandPool computePool;
 
-    // BCn decoding
+    // BCn decoding (only initialized when the GPU lacks native BCn)
+    bool bcn_compute_ok;
     InterceptorState s3tc;
     InterceptorState bc6;
     InterceptorState bc7;
@@ -143,12 +152,17 @@ struct wrapper_device_memory {
    int dmabuf_fd;
    void *map_address;
    size_t map_size;
+   size_t map_offset;
    size_t alloc_size;
    VkDeviceMemory dispatch_handle;
    const VkAllocationCallbacks *alloc;
 };
 
 VkResult enumerate_physical_device(struct vk_instance *_instance);
+
+/* wrapper_xfb.c */
+bool wrapper_spirv_strip_xfb(const uint32_t *code, size_t words,
+                             uint32_t **out, size_t *out_words);
 void destroy_physical_device(struct vk_physical_device *pdevice);
 
 void

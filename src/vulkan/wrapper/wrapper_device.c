@@ -51,7 +51,7 @@ static VkResult InterceptorState_Init(InterceptorState* state, VkDevice device, 
 
 // Cleans up the Vulkan objects.
 // Call this before intercepting vkDestroyDevice.
-static void InterceptorState_Cleanup(InterceptorState* state);
+static void InterceptorState_Cleanup(struct wrapper_device *device, InterceptorState* state);
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -63,11 +63,13 @@ const struct vk_device_extension_table wrapper_device_extensions =
 #endif
    .KHR_present_id = true,
    .KHR_present_wait = true,
-   .KHR_dynamic_rendering = true,
    .KHR_incremental_present = true,
+   /* Implemented by the wrapper itself (see wrapper_device_memory.c). */
    .EXT_map_memory_placed = true,
-   .KHR_maintenance4 = true,
    .KHR_map_memory2 = true,
+   /* NOTE: KHR_dynamic_rendering / KHR_maintenance4 used to be listed here,
+    * which made the wrapper advertise them but never enable them on the
+    * driver. They are now passed through like any other driver extension. */
 };
 
 const struct vk_device_extension_table wrapper_filter_extensions =
@@ -140,10 +142,17 @@ wrapper_create_device_queue(struct wrapper_device *device,
    struct wrapper_queue *queue;
    VkResult result;
 
-   device->queueCount = pCreateInfo->queueCreateInfoCount;
+   uint32_t total = 0;
+   for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++)
+      total += pCreateInfo->pQueueCreateInfos[i].queueCount;
+
+   device->queueCount = 0;
    device->queues = vk_zalloc(&device->vk.alloc,
-                           sizeof(queue) * pCreateInfo->queueCreateInfoCount,
-                           8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+                              sizeof(*device->queues) * MAX2(total, 1),
+                              8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!device->queues)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
    for (int i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       create_info = &pCreateInfo->pQueueCreateInfos[i];
       for (int j = 0; j < create_info->queueCount; j++) {
@@ -161,29 +170,237 @@ wrapper_create_device_queue(struct wrapper_device *device,
                   .queueFamilyIndex = create_info->queueFamilyIndex,
                   .queueIndex = j,
                },
-               &queue->dispatch_handle);;
+               &queue->dispatch_handle);
          } else {
             device->dispatch_table.GetDeviceQueue(
                device->dispatch_handle, create_info->queueFamilyIndex,
                j, &queue->dispatch_handle);
          }
          queue->device = device;
-         device->queues[i] = queue;
 
          result = vk_queue_init(&queue->vk, &device->vk, create_info, j);
          if (result != VK_SUCCESS) {
             vk_free(&device->vk.alloc, queue);
             return result;
          }
-         
+
          list_inithead(&queue->staging_resources);
          simple_mtx_init(&queue->resource_mutex, mtx_plain);
          static uint32_t obj_id = 0;
          queue->obj_id = obj_id++;
+         device->queues[device->queueCount++] = queue;
       }
    }
 
    return VK_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------
+ * vkCreateDevice pNext sanitizing
+ *
+ * The chain belongs to the application, so every modification is recorded
+ * and rolled back once the driver call returned.
+ * ---------------------------------------------------------------------- */
+#define WRAPPER_UNDO_MAX 128
+
+struct wrapper_undo_log {
+   struct {
+      void **ptr;
+      void *ptr_value;
+      VkBool32 *flag;
+      VkBool32 flag_value;
+   } entries[WRAPPER_UNDO_MAX];
+   uint32_t count;
+};
+
+static void
+undo_set_ptr(struct wrapper_undo_log *log, void **where, void *value)
+{
+   if (*where == value)
+      return;
+   if (log->count < WRAPPER_UNDO_MAX) {
+      log->entries[log->count].ptr = where;
+      log->entries[log->count].ptr_value = *where;
+      log->entries[log->count].flag = NULL;
+      log->count++;
+   }
+   *where = value;
+}
+
+static void
+undo_set_flag(struct wrapper_undo_log *log, VkBool32 *where, VkBool32 value)
+{
+   if (*where == value)
+      return;
+   if (log->count < WRAPPER_UNDO_MAX) {
+      log->entries[log->count].ptr = NULL;
+      log->entries[log->count].flag = where;
+      log->entries[log->count].flag_value = *where;
+      log->count++;
+   }
+   *where = value;
+}
+
+static void
+undo_apply(struct wrapper_undo_log *log)
+{
+   while (log->count > 0) {
+      log->count--;
+      if (log->entries[log->count].ptr)
+         *log->entries[log->count].ptr = log->entries[log->count].ptr_value;
+      else
+         *log->entries[log->count].flag = log->entries[log->count].flag_value;
+   }
+}
+
+#define MASK_FEATURE(log, st, field, supported) \
+   do { \
+      if ((st)->field && !(supported)) { \
+         WLOG("Not passing faked feature " #field " to the driver"); \
+         undo_set_flag(log, &(st)->field, VK_FALSE); \
+      } \
+   } while (0)
+
+static void
+mask_core_features(struct wrapper_undo_log *log,
+                   VkPhysicalDeviceFeatures *f,
+                   const struct vk_features *base)
+{
+   if (!f)
+      return;
+   MASK_FEATURE(log, f, geometryShader, base->geometryShader);
+   MASK_FEATURE(log, f, textureCompressionBC, base->textureCompressionBC);
+   MASK_FEATURE(log, f, multiViewport, base->multiViewport);
+   MASK_FEATURE(log, f, depthClamp, base->depthClamp);
+   MASK_FEATURE(log, f, depthBiasClamp, base->depthBiasClamp);
+   MASK_FEATURE(log, f, fillModeNonSolid, base->fillModeNonSolid);
+   MASK_FEATURE(log, f, shaderClipDistance, base->shaderClipDistance);
+   MASK_FEATURE(log, f, shaderCullDistance, base->shaderCullDistance);
+   MASK_FEATURE(log, f, dualSrcBlend, base->dualSrcBlend);
+   MASK_FEATURE(log, f, multiDrawIndirect, base->multiDrawIndirect);
+   MASK_FEATURE(log, f, vertexPipelineStoresAndAtomics, base->vertexPipelineStoresAndAtomics);
+
+   if (CHECK_FLAG("FORCE_CLIP_DISTANCE")) {
+      undo_set_flag(log, &f->shaderClipDistance, VK_FALSE);
+      undo_set_flag(log, &f->shaderCullDistance, VK_FALSE);
+   }
+}
+
+/* level 0: drop/mask what the driver does not really support
+ * level 1: additionally keep only the core feature structs */
+static void
+sanitize_device_pnext(struct wrapper_undo_log *log,
+                      VkDeviceCreateInfo *ci,
+                      struct wrapper_physical_device *pdevice,
+                      int level)
+{
+   const uint32_t api = pdevice->properties2.properties.apiVersion;
+   const struct vk_features *base = &pdevice->base_supported_features;
+   const struct vk_device_extension_table *base_ext = &pdevice->base_supported_extensions;
+
+   mask_core_features(log, (VkPhysicalDeviceFeatures *) ci->pEnabledFeatures, base);
+
+   VkBaseOutStructure **link = (VkBaseOutStructure **) &ci->pNext;
+   while (*link) {
+      VkBaseOutStructure *cur = *link;
+      bool drop = false;
+
+      switch ((int32_t) cur->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+         mask_core_features(log, &((VkPhysicalDeviceFeatures2 *) cur)->features, base);
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+         drop = api < VK_API_VERSION_1_1;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+         drop = api < VK_API_VERSION_1_2;
+         if (!drop) {
+            VkPhysicalDeviceVulkan12Features *f = (VkPhysicalDeviceVulkan12Features *) cur;
+            MASK_FEATURE(log, f, hostQueryReset, base->hostQueryReset);
+         }
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
+         drop = api < VK_API_VERSION_1_3;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
+         drop = level > 0 || !base_ext->EXT_robustness2;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT:
+         drop = level > 0 || !base_ext->EXT_transform_feedback;
+         if (!drop) {
+            VkPhysicalDeviceTransformFeedbackFeaturesEXT *f = (VkPhysicalDeviceTransformFeedbackFeaturesEXT *) cur;
+            MASK_FEATURE(log, f, transformFeedback, base->transformFeedback);
+            MASK_FEATURE(log, f, geometryStreams, base->geometryStreams);
+         }
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT:
+         drop = level > 0 || !base_ext->EXT_custom_border_color;
+         if (!drop) {
+            VkPhysicalDeviceCustomBorderColorFeaturesEXT *f = (VkPhysicalDeviceCustomBorderColorFeaturesEXT *) cur;
+            MASK_FEATURE(log, f, customBorderColors, base->customBorderColors);
+            MASK_FEATURE(log, f, customBorderColorWithoutFormat, base->customBorderColorWithoutFormat);
+         }
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
+         drop = level > 0 || (!base_ext->EXT_host_query_reset && api < VK_API_VERSION_1_2);
+         if (!drop) {
+            VkPhysicalDeviceHostQueryResetFeatures *f = (VkPhysicalDeviceHostQueryResetFeatures *) cur;
+            MASK_FEATURE(log, f, hostQueryReset, base->hostQueryReset);
+         }
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT:
+         drop = level > 0 || !pdevice->vk.supported_extensions.EXT_line_rasterization ||
+                !base_ext->EXT_line_rasterization;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT:
+         /* Emulated by the wrapper, the driver never sees the extension. */
+         drop = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
+         /* Implemented by the common WSI code of the wrapper. */
+         drop = true;
+         break;
+      default:
+         drop = level > 0;
+         break;
+      }
+
+      if (drop) {
+         WLOG("Unlinking sType %d from VkDeviceCreateInfo::pNext", cur->sType);
+         undo_set_ptr(log, (void **) link, cur->pNext);
+         continue;
+      }
+      link = &cur->pNext;
+   }
+}
+
+static VkResult
+InterceptorState_InitAll(struct wrapper_device *device)
+{
+   bool validate_bcn = get_validate_bcn_masks() > 0;
+   bool dump_artifacts = (get_dump_bcn_masks() > 0) || validate_bcn;
+   bool use_image_view = use_image_view_mode() && !dump_artifacts;
+   VkDevice handle = wrapper_device_to_handle(device);
+   VkResult result;
+
+   result = InterceptorState_Init(&device->s3tc, handle,
+      use_image_view ? sizeof(s3tc_iv_spv) : sizeof(s3tc_spv),
+      use_image_view ? s3tc_iv_spv : s3tc_spv,
+      use_image_view, 1);
+   if (result != VK_SUCCESS)
+      return result;
+   result = InterceptorState_Init(&device->bc6, handle,
+      use_image_view ? sizeof(bc6_iv_spv) : sizeof(bc6_spv),
+      use_image_view ? bc6_iv_spv : bc6_spv,
+      use_image_view, 6);
+   if (result != VK_SUCCESS)
+      return result;
+   return InterceptorState_Init(&device->bc7, handle,
+      use_image_view ? sizeof(bc7_iv_spv) : sizeof(bc7_spv),
+      use_image_view ? bc7_iv_spv : bc7_spv,
+      use_image_view, 7);
 }
 
 WRAPPER_CreateDevice(VkPhysicalDevice physicalDevice,
@@ -197,8 +414,7 @@ WRAPPER_CreateDevice(VkPhysicalDevice physicalDevice,
    VkDeviceCreateInfo wrapper_create_info = *pCreateInfo;
    struct vk_device_dispatch_table dispatch_table;
    struct wrapper_device *device;
-   VkPhysicalDeviceFeatures2 *pdf2;
-   VkPhysicalDeviceFeatures *pdf;
+   struct wrapper_undo_log undo = { .count = 0 };
    VkResult result;
 
    WLOGD("wrapper_CreateDevice: Application requested the following features");
@@ -212,7 +428,7 @@ WRAPPER_CreateDevice(VkPhysicalDevice physicalDevice,
    list_inithead(&device->command_buffer_list);
    list_inithead(&device->device_memory_list);
 
-   // Depth Stencil overrid
+   // Depth Stencil override
    device->depth_override_mode = get_depth_format_override_mode();
    if (device->depth_override_mode != OVERRIDE_NONE) {
       VkFormatProperties props;
@@ -228,6 +444,8 @@ WRAPPER_CreateDevice(VkPhysicalDevice physicalDevice,
    device->image_map = _mesa_hash_table_u64_create(NULL);
    device->buffer_map = _mesa_hash_table_u64_create(NULL);
    device->command_pool_map = _mesa_hash_table_u64_create(NULL);
+   device->memory_map = _mesa_hash_table_u64_create(NULL);
+   device->fake_xfb_query_pools = _mesa_hash_table_u64_create(NULL);
 
    simple_mtx_init(&device->resource_mutex, mtx_plain);
    device->physical = physical_device;
@@ -239,107 +457,93 @@ WRAPPER_CreateDevice(VkPhysicalDevice physicalDevice,
    vk_device_dispatch_table_from_entrypoints(
       &dispatch_table, &wrapper_device_trampolines, false);
 
-   VkPhysicalDeviceFaultFeaturesEXT fault_features_ext = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
-      .pNext = (void*) wrapper_create_info.pNext,
-   };
-   if (physical_device->base_supported_extensions.EXT_device_fault) {
-      WLOGD("Turning on VK_EXT_device_fault for better GPU fault reporting.");
-      VkPhysicalDeviceFaultFeaturesEXT *ext =
-         (VkPhysicalDeviceFaultFeaturesEXT*) vk_find_struct_const(pCreateInfo, PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
-
-      if (ext == NULL) {
-         wrapper_create_info.pNext = &fault_features_ext;
-         ext = &fault_features_ext;
-      }
-      ext->deviceFault = physical_device->base_supported_features.deviceFault;
-      ext->deviceFaultVendorBinary = physical_device->base_supported_features.deviceFaultVendorBinary;
-   }
-
-#define DISABLE_EXT(extension, type, feature) \
-   if (!physical_device->base_supported_features.feature) { \
-      VK_STRUCTURE_TYPE_##type##_cast *ext = (VK_STRUCTURE_TYPE_##type##_cast *) vk_find_struct_const(pCreateInfo, type); \
-      if (ext) { \
-         WLOG("Faking extension support for " #extension "->" #feature); \
-         ext->feature = ext->feature & physical_device->base_supported_features.feature; \
-      } \
-   }
-
-   DISABLE_EXT(EXT_transform_feedback, PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, geometryStreams);
-   DISABLE_EXT(EXT_transform_feedback, PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, transformFeedback);
-   DISABLE_EXT(EXT_host_query_reset, PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT, hostQueryReset);
-   DISABLE_EXT(EXT_custom_border_color, PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, customBorderColors);
-   DISABLE_EXT(EXT_custom_border_color, PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, customBorderColorWithoutFormat);
-
+   /* vk_device_init validates against the (partly faked) supported
+    * features/extensions, so it must see the untouched application chain. */
    result = vk_device_init(&device->vk, &physical_device->vk,
                            &dispatch_table, pCreateInfo, pAllocator);
 
    if (result != VK_SUCCESS) {
       WLOGE("wrapper_CreateDevice: vk_device_init failed with %d", result);
+      _mesa_hash_table_u64_destroy(device->image_map);
+      _mesa_hash_table_u64_destroy(device->buffer_map);
+      _mesa_hash_table_u64_destroy(device->command_pool_map);
+      _mesa_hash_table_u64_destroy(device->memory_map);
+      _mesa_hash_table_u64_destroy(device->fake_xfb_query_pools);
+      simple_mtx_destroy(&device->resource_mutex);
       vk_free2(&physical_device->instance->vk.alloc, pAllocator,
                device);
       return vk_error(physical_device, result);
    }
-  
+
    wrapper_filter_enabled_extensions(device,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
-  
+
    wrapper_append_required_extensions(&device->vk,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
 
    wrapper_create_info.enabledExtensionCount = wrapper_enable_extension_count;
    wrapper_create_info.ppEnabledExtensionNames = wrapper_enable_extensions;
-   
-   pdf = (void *)pCreateInfo->pEnabledFeatures;
-   pdf2 = __vk_find_struct((void *)pCreateInfo->pNext,
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
-   
-   #define DISABLE_FEATURE(feature) \
-   if (!physical_device->base_supported_features.feature) WLOG("Faking feature support for " #feature); \
-   if (pdf && pdf->feature) { \
-      pdf->feature &= physical_device->base_supported_features.feature; \
-   } \
-   if (pdf2 && pdf2->features.feature) { \
-      pdf2->features.feature &= physical_device->base_supported_features.feature; \
+
+   sanitize_device_pnext(&undo, &wrapper_create_info, physical_device, 0);
+
+   VkPhysicalDeviceFaultFeaturesEXT fault_features_ext = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
+      .pNext = (void*) wrapper_create_info.pNext,
+   };
+   if (physical_device->base_supported_extensions.EXT_device_fault &&
+       !CHECK_FLAG("WRAPPER_NO_DEVICE_FAULT")) {
+      VkPhysicalDeviceFaultFeaturesEXT *ext =
+         (VkPhysicalDeviceFaultFeaturesEXT*) vk_find_struct_const(&wrapper_create_info, PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
+      if (ext == NULL) {
+         wrapper_create_info.pNext = &fault_features_ext;
+         ext = &fault_features_ext;
+      }
+      undo_set_flag(&undo, &ext->deviceFault, physical_device->base_supported_features.deviceFault);
+      undo_set_flag(&undo, &ext->deviceFaultVendorBinary, physical_device->base_supported_features.deviceFaultVendorBinary);
    }
 
-   DISABLE_FEATURE(geometryShader);
-   DISABLE_FEATURE(textureCompressionBC);
-   DISABLE_FEATURE(multiViewport);
-   DISABLE_FEATURE(depthClamp);
-   DISABLE_FEATURE(depthBiasClamp);
-   DISABLE_FEATURE(fillModeNonSolid);
-   DISABLE_FEATURE(shaderClipDistance);
-   DISABLE_FEATURE(shaderCullDistance);
-   DISABLE_FEATURE(dualSrcBlend);
-   DISABLE_FEATURE(multiDrawIndirect); // Missing on G57 r32p1
-   DISABLE_FEATURE(vertexPipelineStoresAndAtomics); // Missing on G57 r32p1
-   // DISABLE_FEATURE(logicOp); // Missing on G57 r32p1
-   // DISABLE_FEATURE(variableMultisampleRate); // Missing on G57 r32p1
-   
-   // DEBUG: Disable ClipDistance
-   if (CHECK_FLAG("FORCE_CLIP_DISTANCE")) {
-      if (pdf && pdf->shaderClipDistance) {
-         pdf->shaderClipDistance = false;
-      }
-      if (pdf2 && pdf2->features.shaderClipDistance) {
-         pdf2->features.shaderClipDistance = false;
-      }
-      if (pdf && pdf->shaderCullDistance) {
-         pdf->shaderCullDistance = false;
-      }
-      if (pdf2 && pdf2->features.shaderCullDistance) {
-         pdf2->features.shaderCullDistance = false;
-      }
+   if (should_log() >= LOG_LEVEL_VERBOSE) {
+      for (int i = 0; i < wrapper_enable_extension_count; i++)
+         WLOG("Enabling device extension %s", wrapper_enable_extensions[i]);
    }
 
    result = WPDEVICE.CreateDevice(
       physicalDevice, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
 
+   /* Safe device creation (WRAPPER_SAFE_CREATE_DEVICE, default on): drivers
+    * reject unknown feature structs with VK_ERROR_FEATURE_NOT_PRESENT or
+    * VK_ERROR_EXTENSION_NOT_PRESENT instead of ignoring them. Retry with
+    * only the core feature structs, then with no pNext at all. */
+   if (result != VK_SUCCESS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+       ENV_INT("WRAPPER_SAFE_CREATE_DEVICE", 1)) {
+      WLOGE("Driver vkCreateDevice failed (%d), retrying with core feature structs only", result);
+      sanitize_device_pnext(&undo, &wrapper_create_info, physical_device, 1);
+      result = WPDEVICE.CreateDevice(physicalDevice, &wrapper_create_info,
+                                     pAllocator, &device->dispatch_handle);
+
+      if (result != VK_SUCCESS && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+         WLOGE("Driver vkCreateDevice failed again (%d), retrying with an empty pNext chain", result);
+         VkPhysicalDeviceFeatures core_features;
+         const VkPhysicalDeviceFeatures2 *f2 =
+            vk_find_struct_const(&wrapper_create_info, PHYSICAL_DEVICE_FEATURES_2);
+         if (f2) {
+            core_features = f2->features;
+            wrapper_create_info.pEnabledFeatures = &core_features;
+         }
+         wrapper_create_info.pNext = NULL;
+         result = WPDEVICE.CreateDevice(physicalDevice, &wrapper_create_info,
+                                        pAllocator, &device->dispatch_handle);
+      }
+   }
+
+   undo_apply(&undo);
+
    if (result != VK_SUCCESS) {
+      WLOGE("Driver vkCreateDevice failed: %d", result);
+      device->dispatch_handle = VK_NULL_HANDLE;
       wrapper_DestroyDevice(wrapper_device_to_handle(device),
-                            &device->vk.alloc);
+                            pAllocator);
       return vk_error(physical_device, result);
    }
 
@@ -348,62 +552,47 @@ WRAPPER_CreateDevice(VkPhysicalDevice physicalDevice,
    vk_device_dispatch_table_load(&device->dispatch_table, gdpa,
                                  device->dispatch_handle);
 
-   // Initialize the BCn interceptor states
-   bool validate_bcn = get_validate_bcn_masks() > 0;
-   bool dump_artifacts = (get_dump_bcn_masks() > 0) || validate_bcn;
-   bool use_image_view = use_image_view_mode() && !dump_artifacts;
-   
-   result = InterceptorState_Init(&device->s3tc, 
-      wrapper_device_to_handle(device), 
-      use_image_view ? sizeof(s3tc_iv_spv) : sizeof(s3tc_spv), 
-      use_image_view ? s3tc_iv_spv : s3tc_spv, 
-      use_image_view, 1);
-   if (result != VK_SUCCESS) {
-      WLOGE("Failed to initialize InterceptorState for s3tc");
-      return vk_error(physical_device, result);
-   }
-   result = InterceptorState_Init(&device->bc6, 
-      wrapper_device_to_handle(device), 
-      use_image_view ? sizeof(bc6_iv_spv) : sizeof(bc6_spv), 
-      use_image_view ? bc6_iv_spv : bc6_spv, 
-      use_image_view, 6);
-   if (result != VK_SUCCESS) {
-      WLOGE("Failed to initialize InterceptorState for bc6");
-      return vk_error(physical_device, result);
-   }
-   result = InterceptorState_Init(&device->bc7, 
-      wrapper_device_to_handle(device), 
-      use_image_view ? sizeof(bc7_iv_spv) : sizeof(bc7_spv), 
-      use_image_view ? bc7_iv_spv : bc7_spv, 
-      use_image_view, 7);
-   if (result != VK_SUCCESS) {
-      WLOGE("Failed to initialize InterceptorState for bc7");
-      return vk_error(physical_device, result);
-   }
-
    result = wrapper_create_device_queue(device, pCreateInfo);
    if (result != VK_SUCCESS) {
       wrapper_DestroyDevice(wrapper_device_to_handle(device),
-                            &device->vk.alloc);
+                            pAllocator);
       return vk_error(physical_device, result);
    }
 
-   // Allocate a dedicated pool for graphics/compute tasks
-   int graphics_queue_idx = FindGraphicsComputeQueueFamilies(physical_device);
-   if (graphics_queue_idx >= 0) {
-      device->graphics_queue = device->queues[graphics_queue_idx];
-      device->graphics_queue_idx = graphics_queue_idx;
-      VkCommandPoolCreateInfo commandPoolInfo = {
-         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-         .queueFamilyIndex = graphics_queue_idx,
-      };
+   /* BCn compute decoders are only needed when the GPU lacks native BCn
+    * (never the case on recent Adreno drivers). Building them is optional:
+    * a failure only disables the GPU path, it must not fail the device. */
+   device->bcn_compute_ok = false;
+   if (physical_device->needs_bc1_emulation || physical_device->needs_bc4_emulation) {
+      result = InterceptorState_InitAll(device);
+      if (result == VK_SUCCESS) {
+         device->bcn_compute_ok = true;
+      } else {
+         WLOGE("BCn compute decoder init failed (%d), falling back to CPU decoding", result);
+      }
 
-      WCHECK(CreateCommandPool((VkDevice) device, &commandPoolInfo, NULL, &device->computePool));
-   } else {
-      WLOGE("Could not find a graphics & compute queue");
+      int graphics_queue_idx = FindGraphicsComputeQueueFamilies(physical_device);
+      if (graphics_queue_idx >= 0) {
+         device->graphics_queue_idx = graphics_queue_idx;
+         device->graphics_queue = NULL;
+         for (uint32_t i = 0; i < device->queueCount; i++) {
+            if (device->queues[i]->vk.queue_family_index == graphics_queue_idx) {
+               device->graphics_queue = device->queues[i];
+               break;
+            }
+         }
+         VkCommandPoolCreateInfo commandPoolInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = graphics_queue_idx,
+         };
+         WCHECK(CreateCommandPool((VkDevice) device, &commandPoolInfo, NULL, &device->computePool));
+      } else {
+         WLOGE("Could not find a graphics & compute queue");
+         device->bcn_compute_ok = false;
+      }
    }
-   
+
    *pDevice = wrapper_device_to_handle(device);
 
    return VK_SUCCESS;
@@ -577,6 +766,18 @@ WRAPPER_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
 
+   /* Internal objects first: they go through the wrapper's own tracking
+    * (buffers, emulated memory) which is torn down below. */
+   if (device->dispatch_handle != VK_NULL_HANDLE) {
+      InterceptorState_Cleanup(device, &device->s3tc);
+      InterceptorState_Cleanup(device, &device->bc6);
+      InterceptorState_Cleanup(device, &device->bc7);
+      if (device->computePool != VK_NULL_HANDLE) {
+         WCHECKV(DestroyCommandPool(_device, device->computePool, NULL));
+         device->computePool = VK_NULL_HANDLE;
+      }
+   }
+
    simple_mtx_lock(&device->resource_mutex);
 
    list_for_each_entry_safe(struct wrapper_command_buffer, wcb,
@@ -608,9 +809,18 @@ WRAPPER_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
    }
    _mesa_hash_table_u64_destroy(device->command_pool_map);
 
+   _mesa_hash_table_u64_destroy(device->memory_map);
+   device->memory_map = NULL;
+   _mesa_hash_table_u64_destroy(device->fake_xfb_query_pools);
+   device->fake_xfb_query_pools = NULL;
+
    list_for_each_entry_safe(struct vk_queue, queue, &device->vk.queues, link) {
       vk_queue_finish(queue);
-      vk_free2(&device->vk.alloc, pAllocator, queue);
+      vk_free(&device->vk.alloc, queue);
+   }
+   if (device->queues) {
+      vk_free(&device->vk.alloc, device->queues);
+      device->queues = NULL;
    }
    if (device->dispatch_handle != VK_NULL_HANDLE) {
       device->dispatch_table.DestroyDevice(device->
@@ -712,13 +922,27 @@ WRAPPER_CreateBuffer(
    VkBuffer* pBuffer)
 {
    VK_FROM_HANDLE(wrapper_device, base, device);
-   // Add storage bit to createInfo
    VkBufferCreateInfo _pCreateInfo = *pCreateInfo;
-   _pCreateInfo.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+   /* The GPU BCn decoder reads upload buffers as storage buffers. Only add
+    * the usage bit when that path can actually run: on GPUs with native BCn
+    * (Adreno) it just changes alignment/placement of every buffer, and it
+    * is ignored anyway when VkBufferUsageFlags2CreateInfoKHR is chained. */
+   if (base->bcn_compute_ok &&
+       (pCreateInfo->usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) &&
+       !vk_find_struct_const(pCreateInfo->pNext, BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR) &&
+       !vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO))
+      _pCreateInfo.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
    VkResult result = CHECK(CreateBuffer(device, &_pCreateInfo, pAllocator, pBuffer));
+   if (result != VK_SUCCESS)
+      return result;
+
    wrapper_buffer *wbuf = wrapper_buffer_create(base, &_pCreateInfo, *pBuffer);
    if (wbuf == NULL) {
       WLOGE("wrapper_buffer_create failed");
+      CHECKV(DestroyBuffer(device, *pBuffer, pAllocator));
+      *pBuffer = VK_NULL_HANDLE;
       return vk_error(&base->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    list_inithead(&wbuf->temp_descriptor_pools);
@@ -978,6 +1202,21 @@ static VkResult InterceptorState_Init(InterceptorState* state, VkDevice device, 
    result = WCHECK(CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, NULL, &state->pipeline));
    WCHECKV(DestroyShaderModule(device, computeShaderModule, NULL));
    return result;
+}
+
+static void InterceptorState_Cleanup(struct wrapper_device *device, InterceptorState* state) {
+   VkDevice handle = wrapper_device_to_handle(device);
+   if (state->pipeline != VK_NULL_HANDLE)
+      CHECKV(DestroyPipeline(handle, state->pipeline, NULL));
+   if (state->pipelineLayout != VK_NULL_HANDLE)
+      CHECKV(DestroyPipelineLayout(handle, state->pipelineLayout, NULL));
+   if (state->descriptorSetLayout != VK_NULL_HANDLE)
+      CHECKV(DestroyDescriptorSetLayout(handle, state->descriptorSetLayout, NULL));
+   if (state->constantsBuffer != VK_NULL_HANDLE)
+      WCHECKV(DestroyBuffer(handle, state->constantsBuffer, NULL));
+   if (state->constantsBufferMemory != VK_NULL_HANDLE)
+      WCHECKV(FreeMemory(handle, state->constantsBufferMemory, NULL));
+   memset(state, 0, sizeof(*state));
 }
 
 // TODO: deprecate this pass in the future
@@ -1539,16 +1778,26 @@ WRAPPER_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
    VkDevice device = _device->dispatch_handle;
    VkResult result;
 
+   /* Fast path: nothing to emulate on this device (native BCn). */
+   if (!_device->physical->needs_bc1_emulation && !_device->physical->needs_bc4_emulation &&
+       !get_dump_src_bcn_masks()) {
+      CHECKV(CmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions));
+      return;
+   }
+
    struct wrapper_image* wimg = get_wrapper_image(_device, dstImage);
    if (!wimg) {
-      WLOGE("wrapper_CmdCopyBufferToImage: dstImage not tracked");
+      /* Untracked image (e.g. created before the device was wrapped):
+       * never drop the copy. */
+      CHECKV(CmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions));
       return;
    }
 
    _Atomic static int counter = 0;
    int decode_id = counter++;
 
-   bool dump_src_bcn = (get_dump_src_bcn_masks() & (1 << (wimg->original_format - 131))) != 0;
+   bool dump_src_bcn = is_bc_image_format(wimg->original_format) &&
+                       (get_dump_src_bcn_masks() & (1 << (wimg->original_format - 131))) != 0;
    if (dump_src_bcn) {
       WLOGD("Dumping bcn src artifacts for format=%d, decode_id=%d", wimg->original_format, decode_id);
       RecordBCnSrcArtifacts(_device, wimg->original_format, pRegions, srcBuffer, decode_id);
@@ -1568,7 +1817,7 @@ WRAPPER_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
    bool validate_bcn = (get_validate_bcn_masks() & (1 << (wimg->original_format - 131))) != 0;
    bool dump_artifacts = ((get_dump_bcn_masks() & (1 << (wimg->original_format - 131))) != 0) || validate_bcn;
    bool use_cpu_bcn = (get_host_decoding_bcn_masks() & (1 << (wimg->original_format - 131))) != 0;
-   bool use_compute_shader = use_compute_shader_mode() && !use_cpu_bcn;
+   bool use_compute_shader = use_compute_shader_mode() && !use_cpu_bcn && _device->bcn_compute_ok;
    bool use_image_view = use_image_view_mode() && !use_cpu_bcn && get_validate_bcn_masks() == 0 && get_dump_bcn_masks() == 0;
    bool check_for_striping = CHECK_FLAG("CHECK_FOR_STRIPING");
    // Check if the queues are the same
@@ -1586,8 +1835,19 @@ WRAPPER_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
 
    struct wrapper_buffer* wbuf = get_wrapper_buffer(_device, srcBuffer);
    if (!wbuf) {
-      WLOG("wrapper_CmdCopyBufferToImage: srcBuffer not tracked");
+      WLOGE("wrapper_CmdCopyBufferToImage: srcBuffer not tracked, cannot decode BCn");
+      return;
    }
+   if (!(wbuf->vk.usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+      /* The compute decoder binds the upload buffer as an SSBO. */
+      use_compute_shader = false;
+      use_image_view = false;
+   }
+
+   /* The image-view path writes straight from the compute shader; without
+    * it a staging buffer is mandatory (CPU decode writes into it). */
+   if (!use_compute_shader)
+      use_image_view = false;
 
    for (uint32_t i = 0; i < regionCount; ++i) {
       const VkBufferImageCopy* region = &pRegions[i];
@@ -1743,71 +2003,168 @@ WRAPPER_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
    }
 }
 
+/* Applies every SPIR-V workaround needed by this device.
+ * Returns the code to hand to the driver: either `code` itself or a buffer
+ * stored in *owned that the caller must free(). */
+static const uint32_t *
+wrapper_patch_spirv(struct wrapper_device *wdev,
+                    const uint32_t *code, size_t code_size,
+                    bool is_inline,
+                    uint32_t **owned, size_t *out_size)
+{
+   const uint32_t driver_id = wdev->physical->driver_properties.driverID;
+   bool needs_clip_distance_emulation = !wdev->physical->base_supported_features.shaderClipDistance
+                                        && !CHECK_FLAG("DISABLE_CLIP_DISTANCE")
+                                        && !ENV_INT("WRAPPER_NO_REMOVE_CLIP_DISTANCE", 0);
+   bool needs_spec_composite_constants_emulation = driver_id == VK_DRIVER_ID_ARM_PROPRIETARY
+                                                   && !CHECK_FLAG("DISABLE_SPEC_COMPOSITE_CONSTANTS")
+                                                   && !ENV_INT("WRAPPER_NO_PATCH_OPCONSTCOMP", 0);
+   bool needs_optimization_barriers = (driver_id == VK_DRIVER_ID_ARM_PROPRIETARY
+                                       || driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY)
+                                          && !CHECK_FLAG("DISABLE_OPTIMIZATION_BARRIERS");
+   bool needs_xfb_strip = !wdev->physical->base_supported_extensions.EXT_transform_feedback
+                          && !CHECK_FLAG("WRAPPER_NO_XFB_STRIP");
+   if (CHECK_FLAG("FORCE_CLIP_DISTANCE"))
+      needs_clip_distance_emulation = true;
+   if (CHECK_FLAG("FORCE_SPEC_COMPOSITE_CONSTANTS"))
+      needs_spec_composite_constants_emulation = true;
+   if (CHECK_FLAG("FORCE_OPTIMIZATION_BARRIERS"))
+      needs_optimization_barriers = true;
+   /* Inline (maintenance5/GPL) shaders historically bypassed this pass;
+    * keep that behaviour unless explicitly requested. */
+   if (is_inline && !CHECK_FLAG("WRAPPER_INLINE_OPTIMIZATION_BARRIERS"))
+      needs_optimization_barriers = false;
+
+   const uint32_t *cur = code;
+   size_t cur_words = code_size / 4;
+   uint32_t *cur_owned = NULL;
+
+#define REPLACE(new_code, new_words) do { \
+      if (cur_owned) free(cur_owned); \
+      cur_owned = (uint32_t *) (new_code); \
+      cur = cur_owned; \
+      cur_words = (new_words); \
+   } while (0)
+
+   if (needs_xfb_strip) {
+      uint32_t *stripped = NULL;
+      size_t words = 0;
+      if (wrapper_spirv_strip_xfb(cur, cur_words, &stripped, &words)) {
+         WLOG("Stripped transform feedback from shader");
+         REPLACE(stripped, words);
+      }
+   }
+
+   if (needs_spec_composite_constants_emulation) {
+      SpirvCode lowered = { 0 };
+      if (fix_mali_spec_composite_constants(cur, cur_words, &lowered))
+         WLOGE("fix_mali_spec_composite_constants failed");
+      else
+         REPLACE(lowered.spirv_code, lowered.spirv_word_count);
+   }
+
+   if (needs_optimization_barriers) {
+      SpirvCode lowered = { 0 };
+      if (add_optimization_barriers(cur, cur_words, &lowered))
+         WLOGE("add_optimization_barriers failed");
+      else
+         REPLACE(lowered.spirv_code, lowered.spirv_word_count);
+   }
+
+   if (needs_clip_distance_emulation) {
+      SpirvCode lowered = { 0 };
+      if (lower_eliminate_clip_distance(cur, cur_words, &lowered))
+         WLOGE("lower_eliminate_clip_distance failed");
+      else
+         REPLACE(lowered.spirv_code, lowered.spirv_word_count);
+   }
+#undef REPLACE
+
+   *owned = cur_owned;
+   *out_size = cur_words * 4;
+   return cur;
+}
+
 WRAPPER_CreateShaderModule(VkDevice device,
     const VkShaderModuleCreateInfo* pCreateInfo,
     const VkAllocationCallbacks* pAllocator,
     VkShaderModule* pShaderModule) {
    VK_FROM_HANDLE(wrapper_device, wdev, device);
-   bool needs_clip_distance_emulation = !wdev->physical->base_supported_features.shaderClipDistance
-                                        && !CHECK_FLAG("DISABLE_CLIP_DISTANCE");
-   bool needs_spec_composite_constants_emulation = wdev->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY
-                                                   && !CHECK_FLAG("DISABLE_SPEC_COMPOSITE_CONSTANTS");
-   bool needs_optimization_barriers = (wdev->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY
-                                       || wdev->physical->driver_properties.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY)
-                                          && !CHECK_FLAG("DISABLE_OPTIMIZATION_BARRIERS");
-   if (CHECK_FLAG("FORCE_CLIP_DISTANCE")) {
-      needs_clip_distance_emulation = true;
-   }
-   if (CHECK_FLAG("FORCE_SPEC_COMPOSITE_CONSTANTS")) {
-      needs_spec_composite_constants_emulation = true;
-   }
-   if (CHECK_FLAG("FORCE_OPTIMIZATION_BARRIERS")) {
-      needs_optimization_barriers = true;
-   }
-
    VkShaderModuleCreateInfo ci = *pCreateInfo;
-   void* spirv1 = NULL;
-   if (needs_spec_composite_constants_emulation) {
-      SpirvCode lowered_spirv = { 0 };
-      if (fix_mali_spec_composite_constants(ci.pCode, ci.codeSize / 4, &lowered_spirv)) {
-         WLOGE("fix_mali_spec_composite_constants failed");
-      } else {
-         ci.codeSize = lowered_spirv.spirv_word_count * 4;
-         ci.pCode = lowered_spirv.spirv_code;
-         spirv1 = lowered_spirv.spirv_code;
-      }
-   }
+   uint32_t *owned = NULL;
+   size_t size = 0;
 
-   void* spirv2 = NULL;
-   if (needs_optimization_barriers) {
-      SpirvCode lowered_spirv = { 0 };
-      if (add_optimization_barriers(ci.pCode, ci.codeSize / 4, &lowered_spirv)) {
-         WLOGE("add_optimization_barriers failed");
-      } else {
-         ci.codeSize = lowered_spirv.spirv_word_count * 4;
-         ci.pCode = lowered_spirv.spirv_code;
-         spirv2 = lowered_spirv.spirv_code;
-      }
-   }
-
-   void* spirv3 = NULL;
-   if (needs_clip_distance_emulation) {
-      SpirvCode lowered_spirv = { 0 };
-      if (lower_eliminate_clip_distance(ci.pCode, ci.codeSize / 4, &lowered_spirv)) {
-         WLOGE("lower_eliminate_clip_distance failed");
-      } else {
-         ci.codeSize = lowered_spirv.spirv_word_count * 4;
-         ci.pCode = lowered_spirv.spirv_code;
-         spirv3 = lowered_spirv.spirv_code;
-      }
-   }
+   ci.pCode = wrapper_patch_spirv(wdev, pCreateInfo->pCode, pCreateInfo->codeSize, false, &owned, &size);
+   ci.codeSize = size;
 
    const VkResult result = CHECK(CreateShaderModule(device, &ci, pAllocator, pShaderModule));
+   free(owned);
+   return result;
+}
 
-   if (spirv1) free(spirv1);
-   if (spirv2) free(spirv2);
-   if (spirv3) free(spirv3);
+/* VK_KHR_maintenance5 / graphics pipeline libraries let applications (DXVK
+ * 2.x) skip vkCreateShaderModule and chain VkShaderModuleCreateInfo directly
+ * into the stage. Patch those in place and restore them afterwards. */
+struct inline_shader_patch {
+   VkShaderModuleCreateInfo *info;
+   const uint32_t *orig_code;
+   size_t orig_size;
+   uint32_t *owned;
+};
 
+static uint32_t
+patch_inline_shaders(struct wrapper_device *wdev,
+                     const VkPipelineShaderStageCreateInfo *stages, uint32_t stage_count,
+                     struct inline_shader_patch *patches, uint32_t max_patches, uint32_t count)
+{
+   for (uint32_t i = 0; i < stage_count && count < max_patches; i++) {
+      if (stages[i].module != VK_NULL_HANDLE)
+         continue;
+      VkShaderModuleCreateInfo *smci = (VkShaderModuleCreateInfo *)
+         vk_find_struct_const(stages[i].pNext, SHADER_MODULE_CREATE_INFO);
+      if (!smci || !smci->pCode)
+         continue;
+      uint32_t *owned = NULL;
+      size_t size = 0;
+      const uint32_t *code = wrapper_patch_spirv(wdev, smci->pCode, smci->codeSize, true, &owned, &size);
+      if (!owned)
+         continue;
+      patches[count++] = (struct inline_shader_patch) {
+         .info = smci, .orig_code = smci->pCode, .orig_size = smci->codeSize, .owned = owned,
+      };
+      smci->pCode = code;
+      smci->codeSize = size;
+   }
+   return count;
+}
+
+static void
+restore_inline_shaders(struct inline_shader_patch *patches, uint32_t count)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      patches[i].info->pCode = patches[i].orig_code;
+      patches[i].info->codeSize = patches[i].orig_size;
+      free(patches[i].owned);
+   }
+}
+
+#define MAX_INLINE_PATCHES 64
+
+WRAPPER_CreateComputePipelines(
+    VkDevice device,
+    VkPipelineCache pipelineCache,
+    uint32_t createInfoCount,
+    const VkComputePipelineCreateInfo* pCreateInfos,
+    const VkAllocationCallbacks* pAllocator,
+    VkPipeline* pPipelines) {
+   VK_FROM_HANDLE(wrapper_device, wdev, device);
+   struct inline_shader_patch patches[MAX_INLINE_PATCHES];
+   uint32_t patch_count = 0;
+   for (uint32_t i = 0; i < createInfoCount; i++)
+      patch_count = patch_inline_shaders(wdev, &pCreateInfos[i].stage, 1,
+                                         patches, MAX_INLINE_PATCHES, patch_count);
+   VkResult result = CHECK(CreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines));
+   restore_inline_shaders(patches, patch_count);
    return result;
 }
 
@@ -1819,43 +2176,56 @@ WRAPPER_CreateGraphicsPipelines(
     const VkAllocationCallbacks* pAllocator,
     VkPipeline* pPipelines) {
    VK_FROM_HANDLE(wrapper_device, wdev, device);
+   const struct vk_features *base = &wdev->physical->base_supported_features;
+
+   struct inline_shader_patch patches[MAX_INLINE_PATCHES];
+   uint32_t patch_count = 0;
+   for (uint32_t i = 0; i < createInfoCount; i++) {
+      if (pCreateInfos[i].pStages)
+         patch_count = patch_inline_shaders(wdev, pCreateInfos[i].pStages, pCreateInfos[i].stageCount,
+                                            patches, MAX_INLINE_PATCHES, patch_count);
+   }
+
+   /* Nothing faked that pipelines depend on: pass through (Adreno). */
+   if (base->fillModeNonSolid && base->geometryShader) {
+      VkResult result = CHECK(CreateGraphicsPipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines));
+      restore_inline_shaders(patches, patch_count);
+      return result;
+   }
+
    struct temporary_objects temp;
    list_inithead(&temp.objects);
    VkGraphicsPipelineCreateInfo* create_infos = TEMP_ARRAY(wdev, &temp, VkGraphicsPipelineCreateInfo, createInfoCount, pCreateInfos);
 
-   // Check for fillModeNonSolid support
-   if (!wdev->physical->base_supported_features.fillModeNonSolid) {
-      for (int i = 0; i < createInfoCount; i++) {
-         if (!create_infos[i].pRasterizationState || create_infos[i].pRasterizationState->polygonMode != VK_POLYGON_MODE_LINE) {
-            continue;
-         }
-         WLOG("VK_POLYGON_MODE_LINE requested, but fillModeNonSolid is not supported on this device, using VK_POLYGON_MODE_FILL instead");
-         ((VkPipelineRasterizationStateCreateInfo*) create_infos[i].pRasterizationState)->polygonMode = VK_POLYGON_MODE_FILL;
-      }
-   }
+   for (uint32_t i = 0; i < createInfoCount; i++) {
+      VkGraphicsPipelineCreateInfo* ci = &create_infos[i];
 
-   // Check for geometryShader support, needed for PVR GPUs
-   // See https://gist.github.com/leegao/e24afbb5f55fe678139197d703d7f600#file-gistfile1-txt-L69
-   if (!wdev->physical->base_supported_features.geometryShader) {
-      for (int i = 0; i < createInfoCount; i++) {
-         VkGraphicsPipelineCreateInfo* ci = &create_infos[i];
-         // Get the number of non-geometryShader stages
-         int stageCount = 0;
-         for (int j = 0; j < ci->stageCount; j++) {
-            if ((ci->pStages[j].stage & VK_SHADER_STAGE_GEOMETRY_BIT) == 0) {
+      // Check for fillModeNonSolid support
+      if (!base->fillModeNonSolid && ci->pRasterizationState &&
+          ci->pRasterizationState->polygonMode != VK_POLYGON_MODE_FILL) {
+         WLOG("Non-solid polygon mode requested, but fillModeNonSolid is not supported, using VK_POLYGON_MODE_FILL instead");
+         VkPipelineRasterizationStateCreateInfo *rs =
+            TEMP_OBJECT(wdev, &temp, VkPipelineRasterizationStateCreateInfo, ci->pRasterizationState);
+         rs->polygonMode = VK_POLYGON_MODE_FILL;
+         ci->pRasterizationState = rs;
+      }
+
+      // Strip geometry shaders when unsupported (PowerVR)
+      if (!base->geometryShader) {
+         uint32_t stageCount = 0;
+         for (uint32_t j = 0; j < ci->stageCount; j++) {
+            if ((ci->pStages[j].stage & VK_SHADER_STAGE_GEOMETRY_BIT) == 0)
                stageCount++;
-            }
          }
-         if (stageCount != ci->stageCount) {
+         if (stageCount == ci->stageCount)
             continue;
-         }
-         int idx = 0;
+
          VkPipelineShaderStageCreateInfo* stages = TEMP_ALLOC(
-            wdev, &temp, VkPipelineShaderStageCreateInfo, sizeof(VkPipelineShaderStageCreateInfo) * stageCount);
-         for (int j = 0; j < ci->stageCount; j++) {
-            if ((ci->pStages[j].stage & VK_SHADER_STAGE_GEOMETRY_BIT) == 0) {
+            wdev, &temp, VkPipelineShaderStageCreateInfo, sizeof(VkPipelineShaderStageCreateInfo) * MAX2(stageCount, 1));
+         uint32_t idx = 0;
+         for (uint32_t j = 0; j < ci->stageCount; j++) {
+            if ((ci->pStages[j].stage & VK_SHADER_STAGE_GEOMETRY_BIT) == 0)
                stages[idx++] = ci->pStages[j];
-            }
          }
          WLOG("A VK_SHADER_STAGE_GEOMETRY stage requested, but geometryShader not supported, disabling it instead.");
          ci->stageCount = stageCount;
@@ -1863,8 +2233,9 @@ WRAPPER_CreateGraphicsPipelines(
       }
    }
 
-   VkResult result = CHECK(CreateGraphicsPipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines));
+   VkResult result = CHECK(CreateGraphicsPipelines(device, pipelineCache, createInfoCount, create_infos, pAllocator, pPipelines));
    free_temp_objects(&temp);
+   restore_inline_shaders(patches, patch_count);
    return result;
 }
 
@@ -1929,22 +2300,102 @@ WRAPPER_CmdPipelineBarrier(
     const VkImageMemoryBarrier* pImageMemoryBarriers)
 {
     VK_FROM_HANDLE(wrapper_command_buffer, base, commandBuffer);
-    VkImageMemoryBarrier* barriers = (VkImageMemoryBarrier*) pImageMemoryBarriers;
+
+    /* Only images whose depth/stencil format was reduced need patching:
+     * skip the per-barrier hash lookups entirely otherwise (hot path). */
+    if (base->device->depth_override_mode == OVERRIDE_NONE || imageMemoryBarrierCount == 0) {
+        CHECKV(CmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
+            memoryBarrierCount, pMemoryBarriers,
+            bufferMemoryBarrierCount, pBufferMemoryBarriers,
+            imageMemoryBarrierCount, pImageMemoryBarriers));
+        return;
+    }
+
     struct temporary_objects temp;
     list_inithead(&temp.objects);
-    if (imageMemoryBarrierCount > 0) {
-        barriers = TEMP_ARRAY(base->device, &temp, VkImageMemoryBarrier, imageMemoryBarrierCount, pImageMemoryBarriers);
-        for (int i = 0; i < imageMemoryBarrierCount; i++) {
-            struct wrapper_image* wimg = get_wrapper_image(base->device, barriers[i].image);
-            // VUID-VkImageMemoryBarrier-subresourceRange-09601
-            if (!HAS_STENCIL(wimg->format) && (barriers[i].subresourceRange.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
-                barriers[i].subresourceRange.aspectMask &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
-            }
+    VkImageMemoryBarrier* barriers = TEMP_ARRAY(base->device, &temp, VkImageMemoryBarrier, imageMemoryBarrierCount, pImageMemoryBarriers);
+    for (int i = 0; i < imageMemoryBarrierCount; i++) {
+        struct wrapper_image* wimg = get_wrapper_image(base->device, barriers[i].image);
+        // VUID-VkImageMemoryBarrier-subresourceRange-09601
+        if (wimg && !HAS_STENCIL(wimg->format) && (barriers[i].subresourceRange.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
+            barriers[i].subresourceRange.aspectMask &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
         }
     }
     CHECKV(CmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
         memoryBarrierCount, pMemoryBarriers,
         bufferMemoryBarrierCount, pBufferMemoryBarriers,
-        imageMemoryBarrierCount, pImageMemoryBarriers));
+        imageMemoryBarrierCount, barriers));
+    free_temp_objects(&temp);
+}
+
+WRAPPER_CmdPipelineBarrier2(
+    VkCommandBuffer commandBuffer,
+    const VkDependencyInfo* pDependencyInfo)
+{
+    VK_FROM_HANDLE(wrapper_command_buffer, base, commandBuffer);
+
+    if (base->device->depth_override_mode == OVERRIDE_NONE ||
+        pDependencyInfo->imageMemoryBarrierCount == 0) {
+        CHECKV(CmdPipelineBarrier2(commandBuffer, pDependencyInfo));
+        return;
+    }
+
+    struct temporary_objects temp;
+    list_inithead(&temp.objects);
+    VkDependencyInfo *info = TEMP_OBJECT(base->device, &temp, VkDependencyInfo, pDependencyInfo);
+    VkImageMemoryBarrier2 *barriers = TEMP_ARRAY(base->device, &temp, VkImageMemoryBarrier2,
+                                                 pDependencyInfo->imageMemoryBarrierCount,
+                                                 pDependencyInfo->pImageMemoryBarriers);
+    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+        struct wrapper_image* wimg = get_wrapper_image(base->device, barriers[i].image);
+        if (wimg && !HAS_STENCIL(wimg->format) && (barriers[i].subresourceRange.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
+            barriers[i].subresourceRange.aspectMask &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+    }
+    info->pImageMemoryBarriers = barriers;
+    CHECKV(CmdPipelineBarrier2(commandBuffer, info));
+    free_temp_objects(&temp);
+}
+
+WRAPPER_CmdCopyBufferToImage2(
+    VkCommandBuffer commandBuffer,
+    const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo)
+{
+    VK_FROM_HANDLE(wrapper_command_buffer, base, commandBuffer);
+    struct wrapper_device *device = base->device;
+
+    if (!device->physical->needs_bc1_emulation && !device->physical->needs_bc4_emulation) {
+        CHECKV(CmdCopyBufferToImage2(commandBuffer, pCopyBufferToImageInfo));
+        return;
+    }
+
+    struct wrapper_image *wimg = get_wrapper_image(device, pCopyBufferToImageInfo->dstImage);
+    if (!wimg || !wimg->is_bcn_emulated) {
+        CHECKV(CmdCopyBufferToImage2(commandBuffer, pCopyBufferToImageInfo));
+        return;
+    }
+
+    /* DXVK 2.x uploads through the *2 entry point: route emulated BCn
+     * uploads to the decoding path. */
+    struct temporary_objects temp;
+    list_inithead(&temp.objects);
+    uint32_t count = pCopyBufferToImageInfo->regionCount;
+    VkBufferImageCopy *regions = TEMP_ALLOC(device, &temp, VkBufferImageCopy,
+                                            sizeof(VkBufferImageCopy) * MAX2(count, 1));
+    for (uint32_t i = 0; i < count; i++) {
+        const VkBufferImageCopy2 *r = &pCopyBufferToImageInfo->pRegions[i];
+        regions[i] = (VkBufferImageCopy) {
+            .bufferOffset = r->bufferOffset,
+            .bufferRowLength = r->bufferRowLength,
+            .bufferImageHeight = r->bufferImageHeight,
+            .imageSubresource = r->imageSubresource,
+            .imageOffset = r->imageOffset,
+            .imageExtent = r->imageExtent,
+        };
+    }
+    WCHECKV(CmdCopyBufferToImage(commandBuffer, pCopyBufferToImageInfo->srcBuffer,
+                                 pCopyBufferToImageInfo->dstImage,
+                                 pCopyBufferToImageInfo->dstImageLayout,
+                                 count, regions));
     free_temp_objects(&temp);
 }
