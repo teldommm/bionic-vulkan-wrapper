@@ -5,9 +5,10 @@ wrapper_icd = custom_target(
   command: [
     prog_python,
     '@INPUT0@',
-    '--api-version', '1.3',
+    '--api-version', '1.4',
     '--xml', '@INPUT1@',
-    '--lib-path', join_paths(get_option('prefix'), get_option('libdir'), 'libvulkan_wrapper.so'),
+    '--icd-lib-path', join_paths(get_option('prefix'), get_option('libdir')),
+    '--icd-filename', 'libvulkan_wrapper.so',
     '--out', '@OUTPUT@',
   ],
   build_by_default: true,

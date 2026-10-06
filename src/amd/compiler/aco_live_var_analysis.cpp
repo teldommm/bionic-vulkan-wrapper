@@ -7,10 +7,12 @@
 
 #include "aco_ir.h"
 
+#include "ac_shader_util.h"
+
 namespace aco {
 
 RegisterDemand
-get_live_changes(aco_ptr<Instruction>& instr)
+get_live_changes(Instruction* instr)
 {
    RegisterDemand changes;
    for (const Definition& def : instr->definitions) {
@@ -29,18 +31,7 @@ get_live_changes(aco_ptr<Instruction>& instr)
 }
 
 RegisterDemand
-get_additional_operand_demand(Instruction* instr)
-{
-   RegisterDemand additional_demand;
-   int op_idx = get_op_fixed_to_def(instr);
-   if (op_idx != -1 && !instr->operands[op_idx].isKill())
-      additional_demand += instr->definitions[0].getTemp();
-
-   return additional_demand;
-}
-
-RegisterDemand
-get_temp_registers(aco_ptr<Instruction>& instr)
+get_temp_registers(Instruction* instr)
 {
    RegisterDemand demand_before;
    RegisterDemand demand_after;
@@ -53,16 +44,36 @@ get_temp_registers(aco_ptr<Instruction>& instr)
    }
 
    for (Operand op : instr->operands) {
-      if (op.isFirstKill()) {
+      if (op.isFirstKill() || op.isCopyKill()) {
          demand_before += op.getTemp();
          if (op.isLateKill())
             demand_after += op.getTemp();
+      } else if (op.isClobbered() && !op.isKill()) {
+         demand_before += op.getTemp();
       }
    }
 
-   demand_before += get_additional_operand_demand(instr.get());
    demand_after.update(demand_before);
    return demand_after;
+}
+
+RegisterDemand get_temp_reg_changes(Instruction* instr)
+{
+   RegisterDemand available_def_space;
+
+   for (Definition def : instr->definitions) {
+      if (def.isTemp())
+         available_def_space += def.getTemp();
+   }
+
+   for (Operand op : instr->operands) {
+      if (op.isFirstKillBeforeDef() || (op.isCopyKill() && !op.isLateKill()))
+         available_def_space -= op.getTemp();
+      else if (op.isClobbered() && !op.isKill())
+         available_def_space -= op.getTemp();
+   }
+
+   return available_def_space;
 }
 
 namespace {
@@ -158,16 +169,44 @@ compute_live_out(live_ctx& ctx, Block* block)
    return live;
 }
 
+template <typename T>
+RegisterDemand
+get_demand_for_reg(live_ctx& ctx, T op_or_def)
+{
+   if (!op_or_def.isPrecolored())
+      return RegisterDemand();
+
+   PhysReg reg = op_or_def.physReg();
+   RegType type = op_or_def.regClass().type();
+
+   if (type == RegType::sgpr && reg >= ctx.program->dev.sgpr_limit)
+      return RegisterDemand();
+
+   PhysReg max_reg = reg.advance(op_or_def.regClass().bytes());
+
+   if (type == RegType::sgpr)
+      return RegisterDemand(0, max_reg);
+   else
+      return RegisterDemand(max_reg - 256, 0);
+}
+
 void
 process_live_temps_per_block(live_ctx& ctx, Block* block)
 {
+   ctx.m.release_reallocate();
+
    RegisterDemand new_demand;
+   unsigned num_linear_vgprs = 0;
    block->register_demand = RegisterDemand();
+   block->call_spills = RegisterDemand();
    IDSet live = compute_live_out(ctx, block);
 
    /* initialize register demand */
-   for (unsigned t : live)
+   for (unsigned t : live) {
       new_demand += Temp(t, ctx.program->temp_rc[t]);
+      if (ctx.program->temp_rc[t].is_linear_vgpr())
+         num_linear_vgprs += ctx.program->temp_rc[t].size();
+   }
 
    /* traverse the instructions backwards */
    int idx;
@@ -176,11 +215,29 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
       if (is_phi(insn))
          break;
 
+      /* Precolored operands may be fixed to a register higher than the current demand.
+       * Record the demand of precolored registers here.
+       */
+      if (insn->hasPrecoloredGPRs()) {
+         RegisterDemand precolored_demand = RegisterDemand();
+         for (Operand op : insn->operands)
+            precolored_demand.update(get_demand_for_reg(ctx, op));
+         for (Definition def : insn->definitions)
+            precolored_demand.update(get_demand_for_reg(ctx, def));
+         ctx.program->fixed_reg_demand.update(precolored_demand);
+      }
+
       ctx.program->needs_vcc |= instr_needs_vcc(insn);
-      insn->register_demand = RegisterDemand(new_demand.vgpr, new_demand.sgpr);
+      RegisterDemand demand_after_instr = RegisterDemand(new_demand.vgpr, new_demand.sgpr);
+      insn->register_demand = demand_after_instr;
+
+      bool has_vgpr_def = false;
 
       /* KILL */
       for (Definition& definition : insn->definitions) {
+         has_vgpr_def |= definition.regClass().type() == RegType::vgpr &&
+                         !definition.regClass().is_linear_vgpr();
+
          if (!definition.isTemp()) {
             continue;
          }
@@ -192,11 +249,35 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
 
          if (n) {
             new_demand -= temp;
+            if (temp.regClass().is_linear_vgpr())
+               num_linear_vgprs -= temp.size();
             definition.setKill(false);
          } else {
             insn->register_demand += temp;
             definition.setKill(true);
          }
+      }
+
+      /* we need to do this in a separate loop because the next one can
+       * setKill() for several operands at once and we don't want to
+       * overwrite that in a later iteration */
+      bool is_vector_op = false;
+      for (Operand& op : insn->operands) {
+         op.setKill(false);
+         /* Linear vgprs must be late kill: this is to ensure linear VGPR operands and
+          * normal VGPR definitions don't try to use the same register, which is problematic
+          * because of assignment restrictions.
+          */
+         bool lateKill =
+            op.hasRegClass() && op.regClass().is_linear_vgpr() && !op.isUndefined() && has_vgpr_def;
+
+         /* If this Operand is part of a vector which is only partially killed by the instruction,
+          * a definition might not fit into the gaps that get created. Mitigate by using lateKill.
+          */
+         // TODO: is it beneficial to skip that if the vector is fully killed?
+         lateKill |= is_vector_op || op.isVectorAligned();
+         op.setLateKill(lateKill);
+         is_vector_op = op.isVectorAligned();
       }
 
       if (ctx.program->gfx_level >= GFX10 && insn->isVALU() &&
@@ -212,39 +293,187 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
             if (insn->operands[op_idx].isOfType(RegType::sgpr))
                insn->operands[op_idx].setLateKill(true);
          }
+      } else if (insn->opcode == aco_opcode::p_bpermute_readlane ||
+                 insn->opcode == aco_opcode::p_bpermute_permlane ||
+                 insn->opcode == aco_opcode::p_bpermute_shared_vgpr ||
+                 insn->opcode == aco_opcode::p_dual_src_export_gfx11 ||
+                 insn->opcode == aco_opcode::v_mqsad_u32_u8) {
+         for (Operand& op : insn->operands)
+            op.setLateKill(true);
+      } else if (insn->opcode == aco_opcode::p_interp_gfx11 && insn->operands.size() == 7) {
+         insn->operands[5].setLateKill(true); /* we re-use the destination reg in the middle */
+      } else if (insn->opcode == aco_opcode::v_interp_p1_f32 && ctx.program->dev.has_16bank_lds) {
+         insn->operands[0].setLateKill(true);
+      } else if (insn->opcode == aco_opcode::p_init_scratch ||
+                 insn->opcode == aco_opcode::p_reload_preserved) {
+         insn->operands.back().setLateKill(true);
+      } else if (instr_info.classes[(int)insn->opcode] == instr_class::wmma) {
+         insn->operands[0].setLateKill(true);
+         insn->operands[1].setLateKill(true);
       }
 
-      /* we need to do this in a separate loop because the next one can
-       * setKill() for several operands at once and we don't want to
-       * overwrite that in a later iteration */
-      for (Operand& op : insn->operands)
-         op.setKill(false);
+      /* Check if a definition clobbers some operand */
+      RegisterDemand operand_demand;
+      auto tied_defs = get_tied_defs(insn);
+      for (auto op_idx : tied_defs) {
+         Temp tmp = insn->operands[op_idx].getTemp();
+         if (std::any_of(tied_defs.begin(), tied_defs.end(), [&](uint32_t i)
+                         { return i < op_idx && insn->operands[i].getTemp() == tmp; })) {
+            operand_demand += tmp;
+            insn->operands[op_idx].setCopyKill(true);
+         }
+         insn->operands[op_idx].setClobbered(true);
+
+         /* We use lateKill as a mitigation for RA issues when allocating definitions with
+          * partially-killed vectors. In case of a vector-aligned operand tied to a definition,
+          * this is irrelevant because the tied definition and the vector occupy the same
+          * register space, and all other definitions are allocated elsewhere.
+          * lateKill operands can't be tied to a definition because their live ranges would
+          * intersect, so remove the lateKill flag again.
+          */
+         if (insn->operands[op_idx].isVectorAligned())
+            insn->operands[op_idx].setLateKill(false);
+         while (insn->operands[op_idx].isVectorAligned()) {
+            ++op_idx;
+            insn->operands[op_idx].setClobbered(true);
+            insn->operands[op_idx].setLateKill(false);
+         }
+      }
 
       /* GEN */
       for (unsigned i = 0; i < insn->operands.size(); ++i) {
          Operand& operand = insn->operands[i];
          if (!operand.isTemp())
             continue;
-         if (operand.isFixed() && operand.physReg() == vcc)
-            ctx.program->needs_vcc = true;
+
          const Temp temp = operand.getTemp();
-         const bool inserted = live.insert(temp.id()).second;
-         if (inserted) {
+         if (operand.isPrecolored()) {
+            assert(!operand.isLateKill());
+            ctx.program->needs_vcc |= operand.physReg() == vcc;
+
+            /* Check if this operand gets overwritten by a precolored definition. */
+            if (std::any_of(insn->definitions.begin(), insn->definitions.end(),
+                            [=](Definition def)
+                            {
+                               return def.isFixed() &&
+                                      def.physReg() + def.size() > operand.physReg() &&
+                                      operand.physReg() + operand.size() > def.physReg();
+                            }))
+               operand.setClobbered(true);
+
+            /* Check if another precolored operand uses the same temporary.
+             * This assumes that operands of one instruction are not precolored twice to
+             * the same register. In this case, register pressure might be overestimated.
+             */
+            for (unsigned j = i + 1; !operand.isCopyKill() && j < insn->operands.size(); ++j) {
+               if (insn->operands[j].isPrecolored() && insn->operands[j].getTemp() == temp) {
+                  operand_demand += temp;
+                  insn->operands[j].setCopyKill(true);
+               }
+            }
+         }
+         /* If this operand is part of a vector, check if the temporary needs to be duplicated. */
+         if (is_vector_op || operand.isVectorAligned()) {
+            /* Set copyKill if any other vector-operand uses the same temporary. If a scalar operand
+             * uses the same temporary, assume that it can share the register. This ignores other
+             * register constraints like tied definitions or precolored registers.
+             */
+            bool other_is_vector_op = false;
+            for (unsigned j = 0; j < i; j++) {
+               if ((other_is_vector_op || insn->operands[j].isVectorAligned()) &&
+                   insn->operands[j].getTemp() == temp) {
+                  operand_demand += temp;
+                  insn->register_demand += temp; /* Because of lateKill */
+                  operand.setCopyKill(true);
+                  break;
+               }
+               other_is_vector_op = insn->operands[j].isVectorAligned();
+            }
+         }
+         is_vector_op = operand.isVectorAligned();
+
+         if (operand.isLateKill()) {
+            /* Make sure that same temporaries have same lateKill flags. */
+            for (Operand& other : insn->operands) {
+               if (other.isTemp() && other.getTemp() == operand.getTemp())
+                  other.setLateKill(true);
+            }
+         }
+
+         if (operand.isKill())
+            continue;
+
+         if (live.insert(temp.id()).second) {
             operand.setFirstKill(true);
             for (unsigned j = i + 1; j < insn->operands.size(); ++j) {
-               if (insn->operands[j].isTemp() && insn->operands[j].tempId() == operand.tempId()) {
-                  insn->operands[j].setFirstKill(false);
+               if (insn->operands[j].isTemp() && insn->operands[j].getTemp() == temp)
                   insn->operands[j].setKill(true);
-               }
             }
             if (operand.isLateKill())
                insn->register_demand += temp;
             new_demand += temp;
+            if (temp.regClass().is_linear_vgpr())
+               num_linear_vgprs += temp.size();
+         } else if (operand.isClobbered()) {
+            operand_demand += temp;
          }
       }
 
-      RegisterDemand before_instr = new_demand + get_additional_operand_demand(insn);
-      insn->register_demand.update(before_instr);
+      if (insn->isCall()) {
+         RegisterDemand limit = get_addr_regs_from_waves(ctx.program, ctx.program->min_waves);
+         insn->call().callee_preserved_limit = insn->call().abi.numPreserved(limit);
+
+         BITSET_DECLARE(preserved_regs, 512);
+         insn->call().abi.preservedRegisters(preserved_regs, limit);
+
+         /* Killed operands effectively make a preserved register unusable for temporaries which we
+          * want to preserve (those included in caller_preserved_demand).
+          */
+         for (auto& op : insn->operands) {
+            if (!op.isTemp() || !op.isPrecolored() || !op.isKill())
+               continue;
+
+            for (unsigned i = 0; i < op.size(); ++i) {
+               if (BITSET_TEST(preserved_regs, op.physReg().reg() + i))
+                  insn->call().callee_preserved_limit -= Temp(0, RegClass(op.regClass().type(), 1));
+            }
+         }
+
+         /* TODO: the spiller can't handle linear VGPRs. For now, the post-RA preserved register
+          * spilling pass makes sure that all live linear VGPRs are preserved across calls.
+          * Therefore, ignore linear VGPRs in the demand calculation here.
+          */
+         insn->call().callee_preserved_limit.vgpr =
+            MAX2(insn->call().callee_preserved_limit.vgpr - (int16_t)num_linear_vgprs, 0);
+
+         insn->call().caller_preserved_demand = demand_after_instr;
+         insn->call().caller_preserved_demand.vgpr -= num_linear_vgprs;
+
+         /* Non-clobbered (neither discardable nor return) parameters are preserved by the callee
+          * if they are placed in clobbered registers.
+          */
+         for (auto& op : insn->operands) {
+            if (!op.isTemp() || !op.isPrecolored() || op.isClobbered() || op.isKill())
+               continue;
+
+            for (unsigned i = 0; i < op.size(); ++i) {
+               if (!BITSET_TEST(preserved_regs, op.physReg().reg() + i))
+                  insn->call().caller_preserved_demand -=
+                     Temp(0, RegClass(op.regClass().type(), 1));
+            }
+         }
+
+         for (unsigned i = 0; i < insn->definitions.size(); ++i) {
+            if (!insn->definitions[i].isKill())
+               insn->call().caller_preserved_demand -= insn->definitions[i].getTemp();
+         }
+
+         block->call_spills.update(insn->call().caller_preserved_demand -
+                                   insn->call().callee_preserved_limit);
+      }
+
+      operand_demand += new_demand;
+      insn->register_demand.update(operand_demand);
       block->register_demand.update(insn->register_demand);
    }
 
@@ -259,8 +488,7 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
          continue;
       }
       Definition& definition = insn->definitions[0];
-      if (definition.isFixed() && definition.physReg() == vcc)
-         ctx.program->needs_vcc = true;
+      ctx.program->needs_vcc |= definition.isFixed() && definition.physReg() == vcc;
       const size_t n = live.erase(definition.tempId());
       if (n && (definition.isKill() || ctx.handled_once > block->index)) {
          Block::edge_vec& preds =
@@ -283,8 +511,6 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
       for (Operand& operand : insn->operands) {
          if (!operand.isTemp())
             continue;
-         if (operand.isFixed() && operand.physReg() == vcc)
-            ctx.program->needs_vcc = true;
 
          /* set if the operand is killed by this (or another) phi instruction */
          operand.setKill(!live.count(operand.tempId()));
@@ -297,17 +523,15 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
                 block->logical_preds.back() <= block->linear_preds.back());
          ctx.worklist = std::max<int>(ctx.worklist, block->linear_preds.back());
       } else {
-         for (unsigned t : live) {
-            aco_err(ctx.program, "Temporary never defined or are defined after use: %%%d in BB%d",
-                    t, block->index);
-         }
+         ASSERTED bool is_valid = validate_ir(ctx.program);
+         assert(!is_valid);
       }
    }
 
    block->live_in_demand = new_demand;
-   block->live_in_demand.sgpr += 2; /* Add 2 SGPRs for potential long-jumps. */
    block->register_demand.update(block->live_in_demand);
    ctx.program->max_reg_demand.update(block->register_demand);
+   ctx.program->max_call_spills.update(block->call_spills);
    ctx.handled_once = std::min(ctx.handled_once, block->index);
 
    assert(!block->linear_preds.empty() || (new_demand == RegisterDemand() && live.empty()));
@@ -382,23 +606,19 @@ round_down(unsigned a, unsigned b)
    return a - (a % b);
 }
 
-uint16_t
-get_addr_sgpr_from_waves(Program* program, uint16_t waves)
+RegisterDemand
+get_addr_regs_from_waves(Program* program, uint16_t waves)
 {
    /* it's not possible to allocate more than 128 SGPRs */
    uint16_t sgprs = std::min(program->dev.physical_sgprs / waves, 128);
-   sgprs = round_down(sgprs, program->dev.sgpr_alloc_granule);
-   sgprs -= get_extra_sgprs(program);
-   return std::min(sgprs, program->dev.sgpr_limit);
-}
+   sgprs = round_down(sgprs, program->dev.sgpr_alloc_granule) - get_extra_sgprs(program);
+   sgprs = std::min(sgprs, program->dev.sgpr_limit);
 
-uint16_t
-get_addr_vgpr_from_waves(Program* program, uint16_t waves)
-{
    uint16_t vgprs = program->dev.physical_vgprs / waves;
    vgprs = vgprs / program->dev.vgpr_alloc_granule * program->dev.vgpr_alloc_granule;
+   vgprs = std::min(vgprs, program->dev.vgpr_limit);
    vgprs -= program->config->num_shared_vgprs / 2;
-   return std::min(vgprs, program->dev.vgpr_limit);
+   return RegisterDemand(vgprs, sgprs);
 }
 
 void
@@ -417,8 +637,8 @@ max_suitable_waves(Program* program, uint16_t waves)
    unsigned num_workgroups = waves * num_simd / waves_per_workgroup;
 
    /* Adjust #workgroups for LDS */
-   unsigned lds_per_workgroup = align(program->config->lds_size * program->dev.lds_encoding_granule,
-                                      program->dev.lds_alloc_granule);
+   unsigned lds_increment = ac_shader_get_lds_alloc_granularity(program->gfx_level);
+   unsigned lds_per_workgroup = align(program->config->lds_size, lds_increment);
 
    if (program->stage == fragment_fs) {
       /* PS inputs are moved from PC (parameter cache) to LDS before PS waves are launched.
@@ -426,8 +646,8 @@ max_suitable_waves(Program* program, uint16_t waves)
        * These limit occupancy the same way as other stages' LDS usage does.
        */
       unsigned lds_bytes_per_interp = 3 * 16;
-      unsigned lds_param_bytes = lds_bytes_per_interp * program->info.ps.num_interp;
-      lds_per_workgroup += align(lds_param_bytes, program->dev.lds_alloc_granule);
+      unsigned lds_param_bytes = lds_bytes_per_interp * program->info.ps.num_inputs;
+      lds_per_workgroup += align(lds_param_bytes, lds_increment);
    }
    unsigned lds_limit = program->wgp_mode ? program->dev.lds_limit * 2 : program->dev.lds_limit;
    if (lds_per_workgroup)
@@ -447,17 +667,19 @@ max_suitable_waves(Program* program, uint16_t waves)
 }
 
 void
-update_vgpr_sgpr_demand(Program* program, const RegisterDemand new_demand)
+update_vgpr_sgpr_demand(Program* program, RegisterDemand new_demand)
 {
    assert(program->min_waves >= 1);
-   uint16_t sgpr_limit = get_addr_sgpr_from_waves(program, program->min_waves);
-   uint16_t vgpr_limit = get_addr_vgpr_from_waves(program, program->min_waves);
+   RegisterDemand limit = get_addr_regs_from_waves(program, program->min_waves);
 
    /* this won't compile, register pressure reduction necessary */
-   if (new_demand.vgpr > vgpr_limit || new_demand.sgpr > sgpr_limit) {
+   if (new_demand.exceeds(limit) || program->max_call_spills != RegisterDemand()) {
       program->num_waves = 0;
       program->max_reg_demand = new_demand;
    } else {
+      RegisterDemand temp_demand = new_demand;
+      new_demand.update(program->fixed_reg_demand);
+
       program->num_waves = program->dev.physical_sgprs / get_sgpr_alloc(program, new_demand.sgpr);
       uint16_t vgpr_demand =
          get_vgpr_alloc(program, new_demand.vgpr) + program->config->num_shared_vgprs / 2;
@@ -465,10 +687,22 @@ update_vgpr_sgpr_demand(Program* program, const RegisterDemand new_demand)
          std::min<uint16_t>(program->num_waves, program->dev.physical_vgprs / vgpr_demand);
       program->num_waves = std::min(program->num_waves, program->dev.max_waves_per_simd);
 
-      /* Adjust for LDS and workgroup multiples and calculate max_reg_demand */
+      /* Adjust for LDS, workgroup multiples and callee ABI, and calculate max_reg_demand */
       program->num_waves = max_suitable_waves(program, program->num_waves);
-      program->max_reg_demand.vgpr = get_addr_vgpr_from_waves(program, program->num_waves);
-      program->max_reg_demand.sgpr = get_addr_sgpr_from_waves(program, program->num_waves);
+      if (program->is_callee) {
+         /* Decrease waves to reduce the chances of needing preserved VGPRs. */
+         std::pair<int, unsigned> best(INT_MIN, program->num_waves);
+         for (; program->num_waves > program->min_waves; program->num_waves--) {
+            program->max_reg_demand = get_addr_regs_from_waves(program, program->num_waves);
+            RegisterDemand clobbered = program->callee_abi.numClobbered(program->max_reg_demand);
+            std::pair<int, unsigned> val(MIN2(clobbered.vgpr - temp_demand.vgpr, 0),
+                                         program->num_waves);
+            if (val > best)
+               best = val;
+         }
+         program->num_waves = best.second;
+      }
+      program->max_reg_demand = get_addr_regs_from_waves(program, program->num_waves);
    }
 }
 
@@ -479,6 +713,8 @@ live_var_analysis(Program* program)
    program->live.memory.release();
    program->live.live_in.resize(program->blocks.size(), IDSet(program->live.memory));
    program->max_reg_demand = RegisterDemand();
+   program->max_call_spills = RegisterDemand();
+   program->fixed_reg_demand = RegisterDemand();
    program->needs_vcc = program->gfx_level >= GFX10;
 
    live_ctx ctx;

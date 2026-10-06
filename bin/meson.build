@@ -11,3 +11,14 @@ gen_vs_module_defs_normal_command = [
 ]
 symbols_check = find_program('symbols-check.py')
 install_megadrivers_py = find_program('install_megadrivers.py')
+install_megadrivers = [
+  install_megadrivers_py.full_path(),
+  '--libname-suffix', libname_suffix,
+]
+
+configure_file(
+  input: 'drm-shim.py',
+  output: 'drm-shim',
+  copy: true
+)
+devenv.prepend('PATH', meson.current_build_dir())

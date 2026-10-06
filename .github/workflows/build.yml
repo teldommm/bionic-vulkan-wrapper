@@ -1,4 +1,4 @@
-name: Android NDK Build (Bionic Wrapper)
+name: Android NDK Build (Bionic Wrapper, Mesa 26.2)
 
 on:
   workflow_dispatch:
@@ -25,8 +25,7 @@ jobs:
 
       - name: Patch sources for NDK build
         run: |
-          # SDK 30+ has native memfd_create in NDK
-          sed -i 's/#if defined(HAVE_MEMFD_CREATE) \&\& !defined __TERMUX__/#if defined(HAVE_MEMFD_CREATE)/' src/util/anon_file.c
+          # Mesa 26.2: anon_file.c needs no Termux patch (memfd via NDK API 30+)
           sed -i "s/dep_libudev = dependency('libudev', required : false)/dep_libudev = null_dep/g" meson.build
 
       - name: Set up Python

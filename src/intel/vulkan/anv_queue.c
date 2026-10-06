@@ -30,6 +30,8 @@
 #include "i915/anv_queue.h"
 #include "xe/anv_queue.h"
 
+#include "vk_common_entrypoints.h"
+
 static VkResult
 anv_create_engine(struct anv_device *device,
                   struct anv_queue *queue,
@@ -41,7 +43,7 @@ anv_create_engine(struct anv_device *device,
    case INTEL_KMD_TYPE_XE:
       return anv_xe_create_engine(device, queue, pCreateInfo);
    default:
-      unreachable("Missing");
+      UNREACHABLE("Missing");
       return VK_ERROR_UNKNOWN;
    }
 }
@@ -58,7 +60,7 @@ anv_destroy_engine(struct anv_queue *queue)
       anv_xe_destroy_engine(device, queue);
       break;
    default:
-      unreachable("Missing");
+      UNREACHABLE("Missing");
    }
 }
 
@@ -90,9 +92,11 @@ anv_queue_init(struct anv_device *device, struct anv_queue *queue,
    }
 
    /* Add a debug fence to wait on submissions if we're using the synchronized
-    * submission feature or the shader-print feature.
+    * submission feature, shader-print feature, or BVH dump.
     */
-   if (INTEL_DEBUG(DEBUG_SYNC | DEBUG_SHADER_PRINT)) {
+   if (INTEL_DEBUG(DEBUG_SYNC) ||
+       ANV_DEBUG(SHADER_PRINT) ||
+       INTEL_DEBUG_BVH_ANY) {
       result = vk_sync_create(&device->vk,
                               &device->physical->sync_syncobj_type,
                               0, 0, &queue->sync);

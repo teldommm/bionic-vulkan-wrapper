@@ -1,24 +1,6 @@
 /*
- * Copyright (c) 2013 Rob Clark <robdclark@gmail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright © 2013 Rob Clark <robdclark@gmail.com>
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef INSTR_A3XX_H_
@@ -100,6 +82,7 @@ typedef enum {
    /* category 1: */
    OPC_MOV             = _OPC(1, 0),
    OPC_MOVP            = _OPC(1, 1),
+   OPC_MOVS            = _OPC(1, 2),
    /* swz, gat, sct */
    OPC_MOVMSK          = _OPC(1, 3),
 
@@ -116,6 +99,10 @@ typedef enum {
    OPC_MOV_GPR         = _OPC(1, 42),
    OPC_MOV_RELGPR      = _OPC(1, 43),
    OPC_MOV_RELCONST    = _OPC(1, 44),
+   OPC_MOVS_IMMED      = _OPC(1, 45),
+   OPC_MOVS_A0         = _OPC(1, 46),
+   OPC_MOVA_R_IMMED    = _OPC(1, 47),
+   OPC_MOVA_R_GPR      = _OPC(1, 48),
 
    /* Macros that expand to an if statement + move */
    OPC_BALLOT_MACRO    = _OPC(1, 50),
@@ -125,6 +112,7 @@ typedef enum {
    OPC_READ_COND_MACRO = _OPC(1, 54),
    OPC_READ_FIRST_MACRO = _OPC(1, 55),
    OPC_SHPS_MACRO       = _OPC(1, 56),
+   OPC_READ_GETLAST_MACRO = _OPC(1, 57),
 
    /* Macros that expand to a loop */
    OPC_SCAN_MACRO      = _OPC(1, 58),
@@ -165,6 +153,10 @@ typedef enum {
    /* 32 - invalid */
    OPC_CMPV_U          = _OPC(2, 33),
    OPC_CMPV_S          = _OPC(2, 34),
+   OPC_MUL_F_MUL2      = _OPC(2, 35),
+   OPC_ADD_F_MUL2      = _OPC(2, 36),
+   OPC_MUL_F_DIV2      = _OPC(2, 37),
+   OPC_ADD_F_DIV2      = _OPC(2, 38),
    /* 35-47 - invalid */
    OPC_MUL_U24         = _OPC(2, 48), /* 24b mul into 32b result */
    OPC_MUL_S24         = _OPC(2, 49), /* 24b mul into 32b result with sign extension */
@@ -210,6 +202,10 @@ typedef enum {
    OPC_DP4ACC          = _OPC(3, 22),
    OPC_WMM             = _OPC(3, 23),
    OPC_WMM_ACCU        = _OPC(3, 24),
+   OPC_MAD_F16_MUL2    = _OPC(3, 25),
+   OPC_MAD_F32_MUL2    = _OPC(3, 26),
+   OPC_MAD_F16_DIV2    = _OPC(3, 27),
+   OPC_MAD_F32_DIV2    = _OPC(3, 28),
 
    /* category 4: */
    OPC_RCP             = _OPC(4, 0),
@@ -263,9 +259,12 @@ typedef enum {
    OPC_QUAD_SHUFFLE_VERT   = _OPC(5, 31),
    OPC_QUAD_SHUFFLE_DIAG   = _OPC(5, 32),
    OPC_TCINV               = _OPC(5, 33),
+   OPC_IMG_BINDLESS_HOF  = _OPC(5, 34),
+   OPC_IMG_BINDLESS_PCMN = _OPC(5, 35),
+   OPC_IMG_BINDLESS      = _OPC(5, 36),
    /* cat5 meta instructions, placed above the cat5 opc field's size */
-   OPC_DSXPP_MACRO     = _OPC(5, 35),
-   OPC_DSYPP_MACRO     = _OPC(5, 36),
+   OPC_DSXPP_MACRO     = _OPC(5, 37),
+   OPC_DSYPP_MACRO     = _OPC(5, 38),
 
    /* category 6: */
    OPC_LDG             = _OPC(6, 0),        /* load-global */
@@ -305,6 +304,7 @@ typedef enum {
    OPC_GETSPID         = _OPC(6, 36), /* SP ID */
    OPC_GETWID          = _OPC(6, 37), /* wavefront ID */
    OPC_GETFIBERID      = _OPC(6, 38), /* fiber ID */
+   OPC_SHFL            = _OPC(6, 39),
 
    /* Logical opcodes for things that differ in a6xx+ */
    OPC_STC             = _OPC(6, 40),
@@ -363,6 +363,9 @@ typedef enum {
     * It loads into const file and should not be optimized in any way.
     */
    OPC_PUSH_CONSTS_LOAD_MACRO = _OPC(6, 84),
+
+   OPC_RAY_INTERSECTION = _OPC(6, 90),
+   OPC_RESBASE          = _OPC(6, 91),
 
    /* category 7: */
    OPC_BAR             = _OPC(7, 0),
@@ -427,6 +430,7 @@ typedef enum {
    TYPE_U32 = 3,
    TYPE_S16 = 4,
    TYPE_S32 = 5,
+   TYPE_ATOMIC_U64 = 6, /* Only valid for a7xx atomics */
    TYPE_U8 = 6,
    TYPE_U8_32 = 7,
 } type_t;
@@ -460,6 +464,8 @@ type_uint_size(unsigned bit_size)
    case 1:  /* 1b bools are treated as normal half-regs */
    case 16: return TYPE_U16;
    case 32: return TYPE_U32;
+   case 64:
+      return TYPE_U32;
    default:
       ir3_assert(0); /* invalid size */
       return (type_t)0;
@@ -523,6 +529,8 @@ regid(int num, int comp)
 #define REG_A0 61 /* address register */
 #define REG_P0 62 /* predicate register */
 #define REG_P0_X regid(REG_P0, 0) /* p0.x */
+
+#define INVALID_CONST_REG UINT16_MAX
 
 /* With is_bindless_s2en = 1, this determines whether bindless is enabled and
  * if so, how to get the (base, index) pair for both sampler and texture.
@@ -646,6 +654,18 @@ is_madsh(opc_t opc)
    switch (opc) {
    case OPC_MADSH_U16:
    case OPC_MADSH_M16:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
+is_sad(opc_t opc)
+{
+   switch (opc) {
+   case OPC_SAD_S16:
+   case OPC_SAD_S32:
       return true;
    default:
       return false;
@@ -803,6 +823,21 @@ is_cat3_float(opc_t opc)
    case OPC_MAD_F32:
    case OPC_SEL_F16:
    case OPC_SEL_F32:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
+is_cat3_alt(opc_t opc)
+{
+   switch (opc) {
+   case OPC_SHLM:
+   case OPC_SHRM:
+   case OPC_SHLG:
+   case OPC_SHRG:
+   case OPC_ANDG:
       return true;
    default:
       return false;

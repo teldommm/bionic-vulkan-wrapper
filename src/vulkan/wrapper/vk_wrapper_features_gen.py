@@ -34,11 +34,6 @@ import mako
 from mako.template import Template
 from vk_extensions import Requirements, get_all_required, filter_api
 
-def str_removeprefix(s, prefix):
-    if s.startswith(prefix):
-        return s[len(prefix):]
-    return s
-
 RENAMED_FEATURES = {
     # See https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/17272#note_1446477 for details
     ('BufferDeviceAddressFeaturesEXT', 'bufferDeviceAddressCaptureReplay'): 'bufferDeviceAddressCaptureReplayEXT',
@@ -50,6 +45,13 @@ RENAMED_FEATURES = {
     ('CooperativeMatrixFeaturesNV', 'cooperativeMatrixRobustBufferAccess'): 'cooperativeMatrixRobustBufferAccessNV',
 
     ('DeviceGeneratedCommandsFeaturesNV', 'deviceGeneratedCommands'): 'deviceGeneratedCommandsNV',
+
+    ("RayTracingInvocationReorderFeaturesNV", "rayTracingInvocationReorder"): "rayTracingInvocationReorderNV",
+
+    ('FaultFeaturesEXT', 'deviceFault'): 'deviceFaultEXT',
+    ('FaultFeaturesEXT', 'deviceFaultVendorBinary'): 'deviceFaultVendorBinaryEXT',
+
+    ('OpacityMicromapFeaturesEXT', 'micromap'): 'micromapEXT',
 }
 
 KNOWN_ALIASES = [
@@ -112,6 +114,38 @@ KNOWN_ALIASES = [
     (['Vulkan13Features', 'DynamicRenderingFeatures'], ['dynamicRendering']),
     (['Vulkan13Features', 'ShaderIntegerDotProductFeatures'], ['shaderIntegerDotProduct']),
     (['Vulkan13Features', 'Maintenance4Features'], ['maintenance4']),
+    (['Vulkan14Features', 'GlobalPriorityQueryFeatures'], ['globalPriorityQuery']),
+    (
+        ['Vulkan14Features', 'ShaderSubgroupRotateFeatures'],
+        ['shaderSubgroupRotate', 'shaderSubgroupRotateClustered'],
+    ),
+    (['Vulkan14Features', 'ShaderFloatControls2Features'], ['shaderFloatControls2']),
+    (['Vulkan14Features', 'ShaderExpectAssumeFeatures'], ['shaderExpectAssume']),
+    (
+        ['Vulkan14Features', 'LineRasterizationFeatures'],
+        [
+            'rectangularLines',
+            'bresenhamLines',
+            'smoothLines',
+            'stippledRectangularLines',
+            'stippledBresenhamLines',
+            'stippledSmoothLines',
+        ],
+    ),
+    (
+        ['Vulkan14Features', 'VertexAttributeDivisorFeatures'],
+        [
+            'vertexAttributeInstanceRateDivisor',
+            'vertexAttributeInstanceRateZeroDivisor',
+        ],
+    ),
+    (['Vulkan14Features', 'IndexTypeUint8Features'], ['indexTypeUint8']),
+    (['Vulkan14Features', 'DynamicRenderingLocalReadFeatures'], ['dynamicRenderingLocalRead']),
+    (['Vulkan14Features', 'Maintenance5Features'], ['maintenance5']),
+    (['Vulkan14Features', 'Maintenance6Features'], ['maintenance6']),
+    (['Vulkan14Features', 'PipelineProtectedAccessFeatures'], ['pipelineProtectedAccess']),
+    (['Vulkan14Features', 'PipelineRobustnessFeatures'], ['pipelineRobustness']),
+    (['Vulkan14Features', 'HostImageCopyFeatures'], ['hostImageCopy']),
 ]
 
 for (feature_structs, features) in KNOWN_ALIASES:
@@ -122,7 +156,7 @@ for (feature_structs, features) in KNOWN_ALIASES:
             RENAMED_FEATURES[rename] = flag
 
 def get_renamed_feature(c_type, feature):
-    return RENAMED_FEATURES.get((str_removeprefix(c_type, 'VkPhysicalDevice'), feature), feature)
+    return RENAMED_FEATURES.get((c_type.removeprefix('VkPhysicalDevice'), feature), feature)
 
 @dataclass
 class FeatureStruct:
@@ -130,7 +164,25 @@ class FeatureStruct:
     c_type: str
     s_type: str
     features: typing.List[str]
+    guard: str
 
+    def condition(self, physical_dev):
+        conds = []
+        if self.reqs.core_version:
+            conds.append(physical_dev + '->properties.apiVersion >= ' +
+                         self.reqs.core_version.c_vk_version())
+        for ext in self.reqs.extensions:
+            conds.append(physical_dev + '->supported_extensions.' +
+                         ext.name[3:])
+        if not conds:
+            return None
+        return '(' + ' || '.join(conds) + ')'
+
+# Wrapper: instead of the runtime's feature helpers, generate
+# wrapper_setup_device_features() which queries every feature struct known to
+# this registry from the underlying driver and fills vk_physical_device's
+# supported_features table. Re-forked from Mesa 26.2.4's
+# vk_physical_device_features_gen.py; only the template and main() differ.
 TEMPLATE_C = Template(COPYRIGHT + """
 /* This file generated from ${filename}, don't edit directly. */
 
@@ -150,22 +202,28 @@ wrapper_setup_device_features(struct wrapper_physical_device *physical_device)
    };
 
 % for f in feature_structs:
+% if f.guard is not None:
+#ifdef ${f.guard}
+% endif
    ${f.c_type} supported_${f.c_type} = {
       .sType = ${f.s_type},
       .pNext = NULL,
    };
    __vk_append_struct(&supported_features2, &supported_${f.c_type});
+% if f.guard is not None:
+#endif
+% endif
 % endfor
 
    physical_device->dispatch_table.GetPhysicalDeviceFeatures2(
       vk_physical_device, &supported_features2);
-   
-    static bool has_already_logged_properties = false;
-    if (!has_already_logged_properties) {
-        has_already_logged_properties = true;
-        WLOG("GetPhysicalDeviceFeatures2");
-        LOG_STRUCT(VkPhysicalDeviceFeatures2, &supported_features2);
-    }
+
+   static bool has_already_logged_properties = false;
+   if (!has_already_logged_properties) {
+      has_already_logged_properties = true;
+      WLOG("GetPhysicalDeviceFeatures2");
+      LOG_STRUCT(VkPhysicalDeviceFeatures2, &supported_features2);
+   }
 
    vk_set_physical_device_features(&physical_device->vk.supported_features,
                                    &supported_features2);
@@ -201,9 +259,10 @@ def get_feature_structs(doc, api, beta):
             continue
 
         reqs = required[_type.attrib['name']]
-        # Skip extensions with a define for now
+        # Skip extensions with a define that isn't a platform define for now
         guard = reqs.guard
-        if guard is not None and (guard != "VK_ENABLE_BETA_EXTENSIONS" or beta != "true"):
+        if guard is not None and ((guard != "VK_ENABLE_BETA_EXTENSIONS" or beta != "true") and
+                                 (not guard.startswith("VK_USE_PLATFORM"))):
             continue
 
         # find Vulkan structure type
@@ -227,7 +286,7 @@ def get_feature_structs(doc, api, beta):
                 assert p.find('./type').text == 'VkBool32'
                 flags.append(m_name)
 
-        feature_struct = FeatureStruct(reqs=reqs, c_type=_type.attrib.get('name'), s_type=s_type, features=flags)
+        feature_struct = FeatureStruct(reqs=reqs, c_type=_type.attrib.get('name'), s_type=s_type, features=flags, guard=guard)
         feature_structs[feature_struct.c_type] = feature_struct
 
     return feature_structs.values()
@@ -257,12 +316,12 @@ def get_feature_structs_from_xml(xml_files, beta, api='vulkan'):
             if renamed_flag not in features:
                 features[renamed_flag] = f.c_type
             else:
-                a = str_removeprefix(features[renamed_flag], 'VkPhysicalDevice')
-                b = str_removeprefix(f.c_type, 'VkPhysicalDevice')
+                a = features[renamed_flag].removeprefix('VkPhysicalDevice')
+                b = f.c_type.removeprefix('VkPhysicalDevice')
                 if (a, flag) not in RENAMED_FEATURES or (b, flag) not in RENAMED_FEATURES:
                     diagnostics.append(f'{a} and {b} both define {flag}')
 
-            unused_renames.pop((str_removeprefix(f.c_type, 'VkPhysicalDevice'), flag), None)
+            unused_renames.pop((f.c_type.removeprefix('VkPhysicalDevice'), flag), None)
 
     for rename in unused_renames:
         diagnostics.append(f'unused rename {rename}')

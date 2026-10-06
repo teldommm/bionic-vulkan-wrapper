@@ -117,7 +117,9 @@ static inline void
 vk_object_base_assert_valid(ASSERTED struct vk_object_base *base,
                             ASSERTED VkObjectType obj_type)
 {
-  // assert(base == NULL || base->type == obj_type);
+   /* Wrapper: wrapped handles (e.g. wrapper_command_buffer) are cast
+    * across object types on purpose; only matters for debug builds. */
+   // assert(base == NULL || base->type == obj_type);
 }
 
 static inline struct vk_object_base *
@@ -126,6 +128,12 @@ vk_object_base_from_u64_handle(uint64_t handle, VkObjectType obj_type)
    struct vk_object_base *base = (struct vk_object_base *)(uintptr_t)handle;
    vk_object_base_assert_valid(base, obj_type);
    return base;
+}
+
+static inline uint64_t
+vk_object_to_u64_handle(struct vk_object_base *obj)
+{
+   return (uintptr_t)obj;
 }
 
 /** Define handle cast macros for the given dispatchable handle type

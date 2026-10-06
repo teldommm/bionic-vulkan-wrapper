@@ -63,6 +63,10 @@ const struct vk_device_extension_table wrapper_device_extensions =
 #endif
    .KHR_present_id = true,
    .KHR_present_wait = true,
+   /* Mesa 26.2 WSI: */
+   .KHR_swapchain_maintenance1 = true,
+   .KHR_present_id2 = true,
+   .KHR_present_wait2 = true,
    .KHR_incremental_present = true,
    /* Implemented by the wrapper itself (see wrapper_device_memory.c). */
    .EXT_map_memory_placed = true,
@@ -79,6 +83,8 @@ const struct vk_device_extension_table wrapper_filter_extensions =
    // .KHR_shader_float_controls = true, // per @bylaws, this only affects Qualcomm
    .KHR_shared_presentable_image = true,
    .EXT_image_compression_control_swapchain = true,
+   /* Driver-side present timing cannot work through the wrapper's WSI. */
+   .EXT_present_timing = true,
 };
 
 static void
@@ -358,7 +364,10 @@ sanitize_device_pnext(struct wrapper_undo_log *log,
          break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
-      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR:
          /* Implemented by the common WSI code of the wrapper. */
          drop = true;
          break;
@@ -631,9 +640,87 @@ WRAPPER_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    return CHECK(QueueSubmit(_queue, submitCount, pSubmits, fence));
 }
 
+/* The Mesa 26 WSI submits its present/blit work with vkQueueSubmit2.
+ * Old Adreno drivers (Vulkan 1.1, no VK_KHR_synchronization2) lack it, so
+ * translate to vkQueueSubmit in that case. */
+static VkResult
+wrapper_queue_submit2_fallback(struct wrapper_queue *queue, uint32_t submitCount,
+                               const VkSubmitInfo2 *pSubmits, VkFence fence)
+{
+   struct wrapper_device *device = queue->device;
+   VkResult result = VK_SUCCESS;
+
+   if (submitCount == 0)
+      return device->dispatch_table.QueueSubmit(queue->dispatch_handle, 0, NULL, fence);
+
+   for (uint32_t i = 0; i < submitCount && result == VK_SUCCESS; i++) {
+      const VkSubmitInfo2 *in = &pSubmits[i];
+      const uint32_t wait_count = in->waitSemaphoreInfoCount;
+      const uint32_t cmd_count = in->commandBufferInfoCount;
+      const uint32_t sig_count = in->signalSemaphoreInfoCount;
+
+      VkSemaphore *wait_sems = calloc(MAX2(wait_count, 1), sizeof(VkSemaphore));
+      uint64_t *wait_values = calloc(MAX2(wait_count, 1), sizeof(uint64_t));
+      VkPipelineStageFlags *wait_stages = calloc(MAX2(wait_count, 1), sizeof(VkPipelineStageFlags));
+      VkCommandBuffer *cmds = calloc(MAX2(cmd_count, 1), sizeof(VkCommandBuffer));
+      VkSemaphore *sig_sems = calloc(MAX2(sig_count, 1), sizeof(VkSemaphore));
+      uint64_t *sig_values = calloc(MAX2(sig_count, 1), sizeof(uint64_t));
+      if (!wait_sems || !wait_values || !wait_stages || !cmds || !sig_sems || !sig_values) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      } else {
+         bool timeline = false;
+         for (uint32_t j = 0; j < wait_count; j++) {
+            wait_sems[j] = in->pWaitSemaphoreInfos[j].semaphore;
+            wait_values[j] = in->pWaitSemaphoreInfos[j].value;
+            VkPipelineStageFlags2 stage = in->pWaitSemaphoreInfos[j].stageMask;
+            wait_stages[j] = (VkPipelineStageFlags) (stage & 0xffffffffull);
+            if (!wait_stages[j])
+               wait_stages[j] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            timeline |= wait_values[j] != 0;
+         }
+         for (uint32_t j = 0; j < cmd_count; j++)
+            cmds[j] = wrapper_command_buffer_from_handle(
+               in->pCommandBufferInfos[j].commandBuffer)->dispatch_handle;
+         for (uint32_t j = 0; j < sig_count; j++) {
+            sig_sems[j] = in->pSignalSemaphoreInfos[j].semaphore;
+            sig_values[j] = in->pSignalSemaphoreInfos[j].value;
+            timeline |= sig_values[j] != 0;
+         }
+
+         VkTimelineSemaphoreSubmitInfo timeline_info = {
+            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            .waitSemaphoreValueCount = wait_count,
+            .pWaitSemaphoreValues = wait_values,
+            .signalSemaphoreValueCount = sig_count,
+            .pSignalSemaphoreValues = sig_values,
+         };
+         VkSubmitInfo submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = timeline ? &timeline_info : NULL,
+            .waitSemaphoreCount = wait_count,
+            .pWaitSemaphores = wait_sems,
+            .pWaitDstStageMask = wait_stages,
+            .commandBufferCount = cmd_count,
+            .pCommandBuffers = cmds,
+            .signalSemaphoreCount = sig_count,
+            .pSignalSemaphores = sig_sems,
+         };
+         /* Only the last batch signals the fence. */
+         result = device->dispatch_table.QueueSubmit(queue->dispatch_handle, 1, &submit,
+                                                     i + 1 == submitCount ? fence : VK_NULL_HANDLE);
+      }
+      free(wait_sems); free(wait_values); free(wait_stages);
+      free(cmds); free(sig_sems); free(sig_values);
+   }
+   return result;
+}
+
 WRAPPER_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
                      const VkSubmitInfo2* pSubmits, VkFence fence)
 {
+   VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   if (queue->device->dispatch_table.QueueSubmit2 == NULL)
+      return wrapper_queue_submit2_fallback(queue, submitCount, pSubmits, fence);
    return CHECK(QueueSubmit2(_queue, submitCount, pSubmits, fence));
 }
 

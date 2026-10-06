@@ -27,10 +27,12 @@
 #include "u_queue.h"
 
 #include "c11/threads.h"
+#include "perf/u_perfetto.h"
 #include "util/u_cpu_detect.h"
 #include "util/os_time.h"
 #include "util/u_string.h"
 #include "util/u_thread.h"
+#include "util/timespec.h"
 #include "u_process.h"
 
 #if defined(__linux__)
@@ -160,7 +162,7 @@ util_queue_fence_signal(struct util_queue_fence *fence)
 {
    mtx_lock(&fence->mutex);
    fence->signalled = true;
-   cnd_broadcast(&fence->cond);
+   u_cnd_monotonic_broadcast(&fence->cond);
    mtx_unlock(&fence->mutex);
 }
 
@@ -169,7 +171,7 @@ _util_queue_fence_wait(struct util_queue_fence *fence)
 {
    mtx_lock(&fence->mutex);
    while (!fence->signalled)
-      cnd_wait(&fence->cond, &fence->mutex);
+      u_cnd_monotonic_wait(&fence->cond, &fence->mutex);
    mtx_unlock(&fence->mutex);
 }
 
@@ -177,31 +179,15 @@ bool
 _util_queue_fence_wait_timeout(struct util_queue_fence *fence,
                                int64_t abs_timeout)
 {
-   /* This terrible hack is made necessary by the fact that we really want an
-    * internal interface consistent with os_time_*, but cnd_timedwait is spec'd
-    * to be relative to the TIME_UTC clock.
-    */
-   int64_t rel = abs_timeout - os_time_get_nano();
+   struct timespec ts;
+   timespec_from_nsec(&ts, abs_timeout);
 
-   if (rel > 0) {
-      struct timespec ts;
-
-      timespec_get(&ts, TIME_UTC);
-
-      ts.tv_sec += abs_timeout / (1000*1000*1000);
-      ts.tv_nsec += abs_timeout % (1000*1000*1000);
-      if (ts.tv_nsec >= (1000*1000*1000)) {
-         ts.tv_sec++;
-         ts.tv_nsec -= (1000*1000*1000);
-      }
-
-      mtx_lock(&fence->mutex);
-      while (!fence->signalled) {
-         if (cnd_timedwait(&fence->cond, &fence->mutex, &ts) != thrd_success)
-            break;
-      }
-      mtx_unlock(&fence->mutex);
+   mtx_lock(&fence->mutex);
+   while (!fence->signalled) {
+      if (u_cnd_monotonic_timedwait(&fence->cond, &fence->mutex, &ts) != thrd_success)
+         break;
    }
+   mtx_unlock(&fence->mutex);
 
    return fence->signalled;
 }
@@ -211,7 +197,7 @@ util_queue_fence_init(struct util_queue_fence *fence)
 {
    memset(fence, 0, sizeof(*fence));
    (void) mtx_init(&fence->mutex, mtx_plain);
-   cnd_init(&fence->cond);
+   u_cnd_monotonic_init(&fence->cond);
    fence->signalled = true;
 }
 
@@ -232,7 +218,7 @@ util_queue_fence_destroy(struct util_queue_fence *fence)
    mtx_lock(&fence->mutex);
    mtx_unlock(&fence->mutex);
 
-   cnd_destroy(&fence->cond);
+   u_cnd_monotonic_destroy(&fence->cond);
    mtx_destroy(&fence->mutex);
 }
 #endif
@@ -286,8 +272,10 @@ util_queue_thread_func(void *input)
       assert(queue->num_queued >= 0 && queue->num_queued <= queue->max_jobs);
 
       /* wait if the queue is empty */
-      while (thread_index < queue->num_threads && queue->num_queued == 0)
+      while (thread_index < queue->num_threads && queue->num_queued == 0) {
+         util_perfetto_thread_flush();
          cnd_wait(&queue->has_queued_cond, &queue->lock);
+      }
 
       /* only kill threads that are above "num_threads" */
       if (thread_index >= queue->num_threads) {
@@ -619,8 +607,10 @@ util_queue_add_job_locked(struct util_queue *queue,
          queue->max_jobs = new_max_jobs;
       } else {
          /* Wait until there is a free slot. */
-         while (queue->num_queued == queue->max_jobs)
+         while (queue->num_queued == queue->max_jobs) {
+            util_perfetto_thread_flush();
             cnd_wait(&queue->has_space_cond, &queue->lock);
+         }
       }
    }
 
@@ -723,6 +713,7 @@ util_queue_finish(struct util_queue *queue)
    queue->create_threads_on_demand = false;
 
    fences = malloc(queue->num_threads * sizeof(*fences));
+   unsigned num_fences = queue->num_threads;
    util_barrier_init(&barrier, queue->num_threads);
 
    for (unsigned i = 0; i < queue->num_threads; ++i) {
@@ -733,7 +724,7 @@ util_queue_finish(struct util_queue *queue)
    queue->create_threads_on_demand = true;
    mtx_unlock(&queue->lock);
 
-   for (unsigned i = 0; i < queue->num_threads; ++i) {
+   for (unsigned i = 0; i < num_fences; ++i) {
       util_queue_fence_wait(&fences[i]);
       util_queue_fence_destroy(&fences[i]);
    }

@@ -31,10 +31,11 @@ there are a couple of files:
 
 * ``*.spv``: SPIR-V binaries of the pipeline that was bound when the hang
   occurred.
+* ``addr_binding_report.log``: VK_EXT_address_binding_report logs.
 * ``app_info.log``: ``VkApplicationInfo`` fields.
 * ``bo_history.log``: A list of every GPU memory allocation and deallocation.
   If the GPU hang was caused by a page fault, you can use
-  `radv_check_va.py <https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/vulkan/radv_check_va.py>`__
+  `radv_check_va.py <https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/vulkan/tools/radv_check_va.py>`__
   to figure out if address is invalid or used after the memory was deallocated.
 * ``bo_ranges.log``: Address ranges that were valid at the time of submission.
 * ``dmesg.log``: Output of ``dmesg``, if available.

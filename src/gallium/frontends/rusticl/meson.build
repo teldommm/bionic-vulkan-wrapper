@@ -1,8 +1,7 @@
 # Copyright ©
 # SPDX-License-Identifier: MIT
 
-fs = import('fs')
-rust = import('rust')
+subdir('builtin_kernels')
 
 libmesa_rust_util_files = files(
   'util/lib.rs',
@@ -26,6 +25,10 @@ libmesa_rust_files = files(
   'mesa/pipe/fence.rs',
   'mesa/pipe/screen.rs',
   'mesa/pipe/transfer.rs',
+  'mesa/util.rs',
+  'mesa/util/disk_cache.rs',
+  'mesa/util/queue.rs',
+  'mesa/util/vm.rs',
 )
 
 rusticl_proc_macros_files = files(
@@ -44,6 +47,7 @@ rusticl_files = files(
   'api/platform.rs',
   'api/program.rs',
   'api/queue.rs',
+  'api/semaphore.rs',
   'api/types.rs',
   'api/util.rs',
   'core.rs',
@@ -52,19 +56,26 @@ rusticl_files = files(
   'core/format.rs',
   'core/kernel.rs',
   'core/memory.rs',
+  'core/meta.rs',
   'core/platform.rs',
   'core/program.rs',
   'core/queue.rs',
+  'core/semaphore.rs',
   'core/util.rs',
   'core/version.rs',
   'core/gl.rs',
 )
 
 rusticl_args = [
-  # we want unsafe blocks inside unsafe functions
-  '-Dunsafe_op_in_unsafe_fn',
   # we error on all clippy warnings unless they are disabled
   '-Dclippy::all',
+
+  rust_global_args,
+  rust_2024_lint_args,
+
+  # Should be ran manually before moving to the 2024 edition
+  # '-Dtail_expr_drop_order',
+
   # we want to add asserts in control flow
   '-Aclippy::assertions_on_constants',
   # warns on Arc<_> as keys
@@ -76,26 +87,29 @@ rusticl_args = [
   '-Aclippy::type_complexity',
 ]
 
+# Disable warnings from future rustc versions.
+# TODO: replace with rustc.get_supported_arguments when requiring meson-1.8+
+if rustc.version().version_compare('>= 1.89')
+  rusticl_args += ['-Amismatched_lifetime_syntaxes']
+endif
+
+rusticl_drivers_enable = get_option('gallium-rusticl-enable-drivers')
+foreach driver : rusticl_drivers_enable
+  rusticl_args += [
+    '--cfg', 'rusticl_enable_' + driver,
+  ]
+endforeach
+
 if with_platform_x11
   rusticl_args += [
     '--cfg', 'glx',
   ]
 endif
 
-rusticl_gen_args = [
-  # can't do anything about it anyway
-  '-Aclippy::all',
-  '-Aimproper_ctypes',
-  # Some bindgen versions assume `unsafe_op_in_unsafe_fn`
-  '-Aunused_unsafe',
-  '-Anon_camel_case_types',
-  '-Anon_snake_case',
-  '-Anon_upper_case_globals',
-]
-
 rusticl_bindgen_args = [
+  bindgen_output_args,
+  '--raw-line', '#![allow(warnings)]',
   '--no-convert-floats',
-  '--use-array-pointers-in-arguments',
   '--default-enum-style', 'rust',
   '--with-derive-partialeq',
   '--with-derive-eq',
@@ -105,16 +119,6 @@ rusticl_bindgen_args = [
   '--with-derive-default',
   '--anon-fields-prefix', 'anon_',
 ]
-
-bindgen_version = find_program('bindgen').version()
-
-if bindgen_version == 'unknown'
-  error('Failed to detect bindgen version. If you are using bindgen 0.69.0, please either update to 0.69.1 or downgrade to 0.68.1. You can install the latest version for your user with `cargo install bindgen-cli`.')
-endif
-
-if bindgen_version.version_compare('< 0.65')
-  error('rusticl requires bindgen 0.65 or newer. If your distribution does not ship a recent enough version, you can install the latest version for your user with `cargo install bindgen-cli`.')
-endif
 
 rusticl_bindgen_c_args = [
   '-fno-builtin-malloc',
@@ -127,7 +131,7 @@ cl_c_args = [
   '-DCL_USE_DEPRECATED_OPENCL_2_0_APIS',
   '-DCL_USE_DEPRECATED_OPENCL_2_1_APIS',
   '-DCL_USE_DEPRECATED_OPENCL_2_2_APIS',
-  '-DCL_TARGET_OPENCL_VERSION=300',
+  '-DCL_TARGET_OPENCL_VERSION=310',
 ]
 
 rusticl_opencl_bindings_rs = rust.bindgen(
@@ -135,6 +139,8 @@ rusticl_opencl_bindings_rs = rust.bindgen(
     'rusticl_opencl_bindings.h',
     opencl_headers,
   ],
+  # required by 'CL_intel/cl_ext_private.h'
+  language : 'cpp',
   output : 'rusticl_opencl_bindings.rs',
   include_directories : [
     inc_include,
@@ -180,9 +186,6 @@ rusticl_opencl_gen = static_library(
   rusticl_opencl_bindings_rs,
   gnu_symbol_visibility : 'hidden',
   rust_abi : 'rust',
-  rust_args : [
-    rusticl_gen_args,
-  ],
 )
 
 rusticl_llvm_bindings_rs = rust.bindgen(
@@ -198,8 +201,9 @@ rusticl_llvm_bindings_rs = rust.bindgen(
     dep_llvmspirvlib,
   ],
   args : [
+    bindgen_output_args,
     # we want to limit what to generate bindings for
-    '--generate', 'constructors,functions,types',
+    '--generate', 'constructors,functions,types,vars',
     # and all types will be opaque
     '--opaque-type', '.*',
     # LLVM/Clang/Translator stuff, only used for build-id
@@ -207,6 +211,7 @@ rusticl_llvm_bindings_rs = rust.bindgen(
     '--allowlist-function', 'clang::getClangFullVersion',
     '--allowlist-function', 'llvm::LLVMContext::LLVMContext',
     '--allowlist-function', 'llvm::writeSpirv',
+    '--allowlist-var', 'LLVM_VERSION_.*'
   ],
 )
 
@@ -215,9 +220,6 @@ rusticl_llvm_gen = static_library(
   rusticl_llvm_bindings_rs,
   gnu_symbol_visibility : 'hidden',
   rust_abi : 'rust',
-  rust_args : [
-    rusticl_gen_args,
-  ],
 )
 
 rusticl_libc_bindings_rs = rust.bindgen(
@@ -264,6 +266,10 @@ rusticl_mesa_bindings = rust.bindgen(
   ],
   args : [
     rusticl_bindgen_args,
+
+    # we want that for mesa
+    '--use-array-pointers-in-arguments',
+
     # mesa utils
     '--allowlist-function',     'blob_.*',
     '--allowlist-function',     'disk_cache_.*',
@@ -271,10 +277,17 @@ rusticl_mesa_bindings = rust.bindgen(
     '--allowlist-function',     'mesa_.*',
     '--allowlist-var',          'OS_.*',
     '--allowlist-function',     'rz?alloc_.*',
-    '--allowlist-function',     'SHA1.*',
-    '--allowlist-var',          'SHA1_.*',
+    '--allowlist-var',          'BLAKE3_.*',
+    '--allowlist-function',     '_mesa_blake3_.*',
     '--allowlist-function',     'u_.*',
     '--allowlist-function',     'util_format_.*',
+    '--allowlist-function',     'util_queue_.*',
+    '--allowlist-function',     'util_vma_.*',
+    '--allowlist-function',     'util_get_cpu_caps',
+    '--allowlist-function',     'util_perfetto_thread_flush',
+    '--no-copy',                'util_vma_heap', # it's a linked list
+    '--no-copy',                'util_queue',
+    '--no-copy',                'util_queue_fence',
 
     # CL API
     '--allowlist-type',         'cl_sampler_.*_mode',
@@ -299,6 +312,7 @@ rusticl_mesa_bindings = rust.bindgen(
     '--bitfield-enum',          'nir_lower_int64_options',
     '--bitfield-enum',          'nir_opt_if_options',
     '--bitfield-enum',          'nir_variable_mode',
+    '--bitfield-enum',          'float_controls',
     '--allowlist-function',     'should_.*_nir',
     '--allowlist-function',     'spirv_.*',
 
@@ -315,10 +329,19 @@ rusticl_mesa_bindings = rust.bindgen(
     '--constified-enum-module', 'pipe_tex_filter',
     '--allowlist-type',         'pipe_tex_wrap',
     '--constified-enum-module', 'pipe_tex_wrap',
+    '--allowlist-type',         'pipe_swizzle',
+    '--constified-enum-module', 'pipe_swizzle',
+    '--blocklist-function',     'pipe_shader_state_from_tgsi',
 
     # rusticl C functions
     '--allowlist-function',     'rusticl_.*',
     '--allowlist-function',     'std(err|out)_ptr',
+
+    # libc
+    '--allowlist-function',     'mmap',
+    '--allowlist-function',     'munmap',
+    '--allowlist-var',          'MAP_.*',
+    '--allowlist-var',          'PROT_.*',
 
     # winsys
     '--allowlist-var',          'WINSYS_HANDLE_TYPE_.*',
@@ -356,12 +379,6 @@ rusticl_c = static_library(
   ],
 )
 
-idep_rusticl_gen = declare_dependency(
-  sources: [
-    rusticl_opencl_bindings_rs,
-  ],
-)
-
 libmesa_rust_gen = static_library(
   'mesa_rust_gen',
   rusticl_mesa_bindings[0],
@@ -373,9 +390,6 @@ libmesa_rust_gen = static_library(
     idep_mesaclc,
   ],
   rust_abi : 'rust',
-  rust_args : [
-    rusticl_gen_args,
-  ],
 )
 
 libc_rust_gen = static_library(
@@ -383,9 +397,6 @@ libc_rust_gen = static_library(
   rusticl_libc_bindings_rs,
   gnu_symbol_visibility : 'hidden',
   rust_abi : 'rust',
-  rust_args : [
-    rusticl_gen_args,
-  ],
 )
 
 libmesa_rust_util = static_library(
@@ -438,8 +449,34 @@ librusticl = static_library(
     rusticl_llvm_gen,
     rusticl_opencl_gen,
     rusticl_proc_macros,
-  ],
-  dependencies : [
-    idep_rusticl_gen,
+    rusticl_kernels_spv,
   ],
 )
+
+if meson.version().version_compare('>= 1.9.0') and with_tests
+  # Tests may fail to build with versions of meson prior to 1.9 due to a bug
+  # involving parameters passed to the linker.
+  #
+  # See https://github.com/mesonbuild/meson/issues/14622
+  librusticl_test = static_library(
+    'rusticl_test',
+    'test/lib.rs',
+    rust_abi : 'c',
+    rust_args : rust_global_args,
+  )
+
+  rust.test('rusticl_opencl_gen_test', rusticl_opencl_gen, suite : ['rusticl'])
+  rust.test('rusticl_llvm_gen_test', rusticl_llvm_gen, suite : ['rusticl'])
+  rust.test('rusticl_proc_macros_test', rusticl_proc_macros, suite : ['rusticl'])
+  rust.test('libc_rust_gen_test', libc_rust_gen, suite : ['rusticl'])
+  rust.test('libmesa_rust_gen_test', libmesa_rust_gen, suite : ['rusticl'])
+  rust.test('libmesa_rust_util_test', libmesa_rust_util, suite : ['rusticl'])
+  rust.test('libmesa_rust_test', libmesa_rust, suite : ['rusticl'])
+
+  rust.test('rusticl_test', librusticl,
+    link_with : [
+      librusticl_test,
+    ],
+    suite : ['rusticl'],
+  )
+endif

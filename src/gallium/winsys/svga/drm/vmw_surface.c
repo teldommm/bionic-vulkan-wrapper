@@ -79,7 +79,7 @@ out_unlock:
    mtx_unlock(&vsrf->mutex);
 }
 
- 
+
 void *
 vmw_svga_winsys_surface_map(struct svga_winsys_context *swc,
                             struct svga_winsys_surface *srf,
@@ -144,7 +144,7 @@ vmw_svga_winsys_surface_map(struct svga_winsys_context *swc,
                                            PIPE_MAP_DONTBLOCK | pb_flags);
          if (data)
             goto out_mapped;
-      } 
+      }
 
       /*
        * Attempt to get a new buffer.
@@ -184,7 +184,7 @@ vmw_svga_winsys_surface_map(struct svga_winsys_context *swc,
        * But tell pipe driver to flush now if already on validate list,
        * Otherwise we'll overwrite previous contents.
        */
-      if (!(flags & PIPE_MAP_UNSYNCHRONIZED) && 
+      if (!(flags & PIPE_MAP_UNSYNCHRONIZED) &&
           p_atomic_read(&vsrf->validated)) {
          *retry = true;
          goto out_unlock;
@@ -224,6 +224,15 @@ vmw_svga_winsys_surface_unmap(struct svga_winsys_context *swc,
 }
 
 void
+vmw_svga_winsys_userspace_surface_destroy(struct svga_winsys_context *swc,
+                                          uint32 sid)
+{
+   SVGA3D_DestroyGBSurface(swc, sid);
+   swc->flush(swc, NULL);
+   vmw_swc_surface_clear_userspace_id(swc, sid);
+}
+
+void
 vmw_svga_winsys_surface_reference(struct vmw_svga_winsys_surface **pdst,
                                   struct vmw_svga_winsys_surface *src)
 {
@@ -231,7 +240,7 @@ vmw_svga_winsys_surface_reference(struct vmw_svga_winsys_surface **pdst,
    struct pipe_reference *dst_ref;
    struct vmw_svga_winsys_surface *dst;
 
-   if(pdst == NULL || *pdst == src)
+   if (pdst == NULL || *pdst == src)
       return;
 
    dst = *pdst;
@@ -242,7 +251,10 @@ vmw_svga_winsys_surface_reference(struct vmw_svga_winsys_surface **pdst,
    if (pipe_reference(dst_ref, src_ref)) {
       if (dst->buf)
          vmw_svga_winsys_buffer_destroy(&dst->screen->base, dst->buf);
-      vmw_ioctl_surface_destroy(dst->screen, dst->sid);
+      if (vmw_has_userspace_surface(dst->screen))
+         vmw_svga_winsys_userspace_surface_destroy(dst->screen->swc, dst->sid);
+      else
+         vmw_ioctl_surface_destroy(dst->screen, dst->sid);
 #if MESA_DEBUG
       /* to detect dangling pointers */
       assert(p_atomic_read(&dst->validated) == 0);

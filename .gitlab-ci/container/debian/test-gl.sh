@@ -2,10 +2,15 @@
 # shellcheck disable=SC2086 # we want word splitting
 
 set -e
+
+. .gitlab-ci/setup-test-env.sh
+
 set -o xtrace
 
+section_start debian_setup "Base Debian system setup"
+
 export DEBIAN_FRONTEND=noninteractive
-export LLVM_VERSION="${LLVM_VERSION:=15}"
+: "${LLVM_VERSION:?llvm version not set!}"
 
 apt-get install -y libelogind0  # this interfere with systemd deps, install separately
 
@@ -22,51 +27,37 @@ EPHEMERAL=(
     libcap-dev
     "libclang-cpp${LLVM_VERSION}-dev"
     libdrm-dev
+    libfontconfig-dev
+    libgl-dev
     libgles2-mesa-dev
-    libgtest-dev
+    libglu1-mesa-dev
+    libglx-dev
     libpciaccess-dev
     libpng-dev
     libudev-dev
-    libvulkan-dev
     libwaffle-dev
     libwayland-dev
     libx11-xcb-dev
     libxcb-dri2-0-dev
-    libxcb-dri3-dev
-    libxcb-present-dev
-    libxfixes-dev
     libxkbcommon-dev
     libxrandr-dev
     libxrender-dev
     "llvm-${LLVM_VERSION}-dev"
+    "lld-${LLVM_VERSION}"
     make
     meson
     ocl-icd-opencl-dev
     patch
     pkgconf
-    python3-distutils
+    python-is-python3
+    spirv-headers
     xz-utils
 )
 
 DEPS=(
-    clinfo
-    iptables
-    kmod
-    "libclang-common-${LLVM_VERSION}-dev"
-    "libclang-cpp${LLVM_VERSION}"
-    libcap2
-    libegl1
-    libepoxy0
-    libfdt1
-    libxcb-shm0
-    ocl-icd-libopencl1
-    python3-lxml
-    python3-renderdoc
-    python3-simplejson
-    spirv-tools
-    sysvinit-core
-    weston
-    xwayland
+    libfontconfig1
+    libglu1-mesa
+    libvulkan-dev
 )
 
 apt-get update
@@ -76,6 +67,15 @@ apt-get install -y --no-remove "${DEPS[@]}" "${EPHEMERAL[@]}" \
 
 
 . .gitlab-ci/container/container_pre_build.sh
+
+section_end debian_setup
+
+############### Build ANGLE
+
+if [ "$DEBIAN_ARCH" != "armhf" ]; then
+  ANGLE_TARGET=linux \
+  . .gitlab-ci/container/build-angle.sh
+fi
 
 ############### Build piglit
 
@@ -95,7 +95,15 @@ PIGLIT_OPTS="-DPIGLIT_USE_WAFFLE=ON
 	     -DPIGLIT_BUILD_DMA_BUF_TESTS=ON" \
   . .gitlab-ci/container/build-piglit.sh
 
+############### Build OpenCL-CTS
+
+. .gitlab-ci/container/build-opencl-cts.sh
+
 ############### Build dEQP GL
+
+DEQP_API=tools \
+DEQP_TARGET=surfaceless \
+. .gitlab-ci/container/build-deqp.sh
 
 DEQP_API=GL \
 DEQP_TARGET=surfaceless \
@@ -105,20 +113,29 @@ DEQP_API=GLES \
 DEQP_TARGET=surfaceless \
 . .gitlab-ci/container/build-deqp.sh
 
-############### Build apitrace
-
-. .gitlab-ci/container/build-apitrace.sh
+rm -rf /VK-GL-CTS
 
 ############### Build validation layer for zink
 
 . .gitlab-ci/container/build-vulkan-validation.sh
 
-############### Build nine tests
 
-. .gitlab-ci/container/build-ninetests.sh
+############### Build SKQP
+
+if [ "$DEBIAN_ARCH" != "armhf" ]; then
+  . .gitlab-ci/container/build-skqp.sh
+fi
 
 ############### Uninstall the build software
+
+section_switch debian_cleanup "Cleaning up base Debian system"
 
 apt-get purge -y "${EPHEMERAL[@]}"
 
 . .gitlab-ci/container/container_post_build.sh
+
+section_end debian_cleanup
+
+############### Remove unused packages
+
+. .gitlab-ci/container/strip-rootfs.sh

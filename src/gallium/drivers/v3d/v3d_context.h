@@ -36,10 +36,12 @@
 #include "util/bitset.h"
 #include "util/slab.h"
 #include "util/u_dynarray.h"
+#include "util/u_framebuffer.h"
 #include "xf86drm.h"
 #include "drm-uapi/v3d_drm.h"
 #include "v3d_screen.h"
 #include "broadcom/common/v3d_limits.h"
+#include "broadcom/common/v3d_util.h"
 
 #include "broadcom/simulator/v3d_simulator.h"
 #include "broadcom/compiler/v3d_compiler.h"
@@ -52,12 +54,6 @@ void v3d_job_add_bo(struct v3d_job *job, struct v3d_bo *bo);
 #include "v3d_resource.h"
 #include "v3d_cl.h"
 
-#ifdef USE_V3D_SIMULATOR
-#define using_v3d_simulator true
-#else
-#define using_v3d_simulator false
-#endif
-
 #define V3D_DIRTY_BLEND               (1ull <<  0)
 #define V3D_DIRTY_RASTERIZER          (1ull <<  1)
 #define V3D_DIRTY_ZSA                 (1ull <<  2)
@@ -65,6 +61,7 @@ void v3d_job_add_bo(struct v3d_job *job, struct v3d_bo *bo);
 #define V3D_DIRTY_VERTTEX             (1ull <<  4)
 #define V3D_DIRTY_GEOMTEX             (1ull <<  5)
 #define V3D_DIRTY_FRAGTEX             (1ull <<  6)
+#define V3D_DIRTY_RASTERIZER_SCISSOR  (1ull <<  7)
 
 #define V3D_DIRTY_SHADER_IMAGE        (1ull <<  9)
 #define V3D_DIRTY_BLEND_COLOR         (1ull << 10)
@@ -79,7 +76,7 @@ void v3d_job_add_bo(struct v3d_job *job, struct v3d_bo *bo);
 #define V3D_DIRTY_SCISSOR             (1ull << 19)
 #define V3D_DIRTY_FLAT_SHADE_FLAGS    (1ull << 20)
 #define V3D_DIRTY_PRIM_MODE           (1ull << 21)
-#define V3D_DIRTY_CLIP                (1ull << 22)
+
 #define V3D_DIRTY_UNCOMPILED_CS       (1ull << 23)
 #define V3D_DIRTY_UNCOMPILED_VS       (1ull << 24)
 #define V3D_DIRTY_UNCOMPILED_GS       (1ull << 25)
@@ -101,7 +98,13 @@ void v3d_job_add_bo(struct v3d_job *job, struct v3d_bo *bo);
 
 #define V3D_MAX_FS_INPUTS 64
 
-#define MAX_JOB_SCISSORS 16
+#define V3D_JOB_MAX_SCISSORS 16
+#define V3D_JOB_MAX_BO_HANDLE_COUNT 2048
+#define V3D_JOB_MAX_BO_REFERENCED_SIZE (768 * 1024 * 1024)
+/* Keeps the amount of queued GPU work in the range where the kernel does not
+ * reset. Less than 500ms of work in a tile.
+ */
+#define V3D_JOB_MAX_DRAW_CALLS_QUEUED 16384
 
 enum v3d_sampler_state_variant {
         V3D_SAMPLER_STATE_BORDER_0000,
@@ -151,6 +154,23 @@ enum v3d_flush_cond {
         V3D_FLUSH_NOT_CURRENT_JOB,
 };
 
+/* bitmask */
+enum v3d_blitter_op {
+        V3D_SAVE_TEXTURES          = (1u << 1),
+        V3D_SAVE_FRAMEBUFFER       = (1u << 2),
+        V3D_SAVE_FRAGMENT_STATE    = (1u << 3),
+        V3D_SAVE_FRAGMENT_CONSTANT = (1u << 4),
+        V3D_DISABLE_RENDER_COND    = (1u << 5),
+
+        V3D_BLIT               = V3D_SAVE_FRAMEBUFFER | V3D_SAVE_TEXTURES |
+                                 V3D_SAVE_FRAGMENT_STATE,
+        V3D_BLIT_COND          = V3D_BLIT | V3D_DISABLE_RENDER_COND,
+        V3D_CLEAR              = V3D_SAVE_FRAGMENT_STATE | V3D_SAVE_FRAGMENT_CONSTANT,
+        V3D_CLEAR_COND         = V3D_CLEAR | V3D_DISABLE_RENDER_COND,
+        V3D_CLEAR_SURFACE      = V3D_CLEAR | V3D_SAVE_FRAMEBUFFER,
+        V3D_CLEAR_SURFACE_COND = V3D_CLEAR_SURFACE | V3D_DISABLE_RENDER_COND
+};
+
 struct v3d_sampler_view {
         struct pipe_sampler_view base;
         uint32_t p0;
@@ -160,7 +180,8 @@ struct v3d_sampler_view {
 
         uint8_t texture_shader_state[32];
         /* V3D 4.x: Texture state struct. */
-        struct v3d_bo *bo;
+        struct pipe_resource *tex_state;
+        uint32_t tex_state_offset;
 
         enum v3d_sampler_state_variant sampler_variant;
 
@@ -218,12 +239,13 @@ struct v3d_uncompiled_shader {
         uint32_t num_tf_specs;
 
         /* For caching */
-        unsigned char sha1[20];
+        unsigned char blake3[BLAKE3_KEY_LEN];
 };
 
 struct v3d_compiled_shader {
         struct pipe_resource *resource;
         uint32_t offset;
+        uint32_t qpu_size;
 
         union {
                 struct v3d_prog_data *base;
@@ -294,9 +316,9 @@ struct v3d_ssbo_stateobj {
 
 /* Hash table key for v3d->jobs */
 struct v3d_job_key {
-        struct pipe_surface *cbufs[V3D_MAX_DRAW_BUFFERS];
-        struct pipe_surface *zsbuf;
-        struct pipe_surface *bbuf;
+        struct pipe_surface cbufs[V3D_MAX_DRAW_BUFFERS];
+        struct pipe_surface zsbuf;
+        struct pipe_surface bbuf;
 };
 
 enum v3d_ez_state {
@@ -370,11 +392,14 @@ struct v3d_job {
          * Surfaces to submit rendering for.
          * For blit operations, bbuf is the source surface, and cbufs[0] is
          * the destination surface.
+         * For blit operations straight from the job's tile buffer, dbuf is the
+         * blit destination surface.
          */
         uint32_t nr_cbufs;
-        struct pipe_surface *cbufs[V3D_MAX_DRAW_BUFFERS];
-        struct pipe_surface *zsbuf;
-        struct pipe_surface *bbuf;
+        struct pipe_surface cbufs[V3D_MAX_DRAW_BUFFERS];
+        struct pipe_surface zsbuf;
+        struct pipe_surface bbuf;
+        struct pipe_surface dbuf;
         /** @} */
         /** @{
          * Bounding box of the scissor across all queued drawing.
@@ -402,7 +427,7 @@ struct v3d_job {
                 struct {
                         uint32_t min_x, min_y;
                         uint32_t max_x, max_y;
-                } rects[MAX_JOB_SCISSORS];
+                } rects[V3D_JOB_MAX_SCISSORS];
         } scissor;
 
         /** @} */
@@ -416,11 +441,13 @@ struct v3d_job {
 
         /** @} */
         /** @{ Tile information, depending on MSAA and float color buffer. */
-        uint32_t draw_tiles_x; /** @< Number of tiles wide for framebuffer. */
-        uint32_t draw_tiles_y; /** @< Number of tiles high for framebuffer. */
+        struct {
+                uint32_t draw_x; /** @< Number of tiles wide for framebuffer. */
+                uint32_t draw_y; /** @< Number of tiles high for framebuffer. */
+                uint32_t width;  /** @< Width of a tile. */
+                uint32_t height; /** @< Height of a tile. */
+        } tile_desc;
 
-        uint32_t tile_width; /** @< Width of a tile. */
-        uint32_t tile_height; /** @< Height of a tile. */
         /** maximum internal_bpp of all color render targets. */
         uint32_t internal_bpp;
 
@@ -437,6 +464,10 @@ struct v3d_job {
          * clear.
          */
         uint32_t clear_draw;
+        /* Bitmask of PIPE_CLEAR_* of attached buffers that were invalidated
+         * by glInvalidateFramebuffer so we can avoid loading them.
+         */
+        uint32_t invalidated_load;
         /* Bitmask of PIPE_CLEAR_* of buffers that have been read by a draw
          * call without having been cleared first.
          */
@@ -445,12 +476,27 @@ struct v3d_job {
          * (either clears or draws) and should be stored.
          */
         uint32_t store;
+        /* Bitmask of PIPE_CLEAR_* of buffers that need to be blitted into
+         * a destination buffer other than the jobs RT. Used to implement
+         * blits from jobs that have not yet been flushed, including MSAA
+         * resolve.
+         */
+        uint32_t blit_tlb;
+
         uint32_t clear_color[V3D_MAX_DRAW_BUFFERS][4];
         float clear_z;
         uint8_t clear_s;
 
+        /* If we found anything in the job that is not compatible with
+         * double-buffer mode
+         */
+        bool can_use_double_buffer;
+
         /* If TLB double-buffering is enabled for this job */
         bool double_buffer;
+
+        /* Tracks score for double-buffer mode heuristic */
+        struct v3d_double_buffer_score double_buffer_score;
 
         /**
          * Set if some drawing (triangles, blits, or just a glClear()) has
@@ -501,6 +547,12 @@ struct v3d_job {
         bool early_zs_clear;
 
         /**
+         * Tracks if at least one of the draws/clears submitted to the
+         * job was submitted with GL_RASTERIZER_DISCARD disabled.
+         */
+        bool does_rasterization;
+
+        /**
          * Number of draw calls (not counting full buffer clears) queued in
          * the current job.
          */
@@ -511,6 +563,13 @@ struct v3d_job {
          * the current job during active transform feedback.
          */
         uint32_t tf_draw_calls_queued;
+
+
+        /* A pointer to the location of the TILE_BINNING_MODE_CFG packet so we
+         * can rewrite it to enable double-buffer mode by the time we have
+         * enough info about the job to make that decision.
+         */
+        struct v3d_cl_out *bcl_tile_binning_mode_ptr;
 
         struct v3d_job_key key;
 };
@@ -594,6 +653,18 @@ struct v3d_context {
         unsigned sample_mask;
         struct pipe_framebuffer_state framebuffer;
 
+        /* True when the framebuffer state has a format that needs software
+         * blending to be enabled.
+         */
+        bool framebuffer_soft_blend;
+
+        /* Flags if we have submitted any jobs for the current framebuffer so
+         * we can make skip framebuffer invalidation for cases where we had to
+         * split the command list into multiple jobs for the same frame (i.e.
+         * queries, reaching CL size limits of any kind, etc.).
+         */
+        bool submitted_any_jobs_for_current_fbo;
+
         /* Per render target, whether we should swap the R and B fields in the
          * shader's color output and in blending.  If render targets disagree
          * on the R/B swap and use the constant color, then we would need to
@@ -611,6 +682,16 @@ struct v3d_context {
 
         bool active_queries;
 
+        /* Whether a context with robust buffer access should be created.
+         */
+        bool robust_buffer;
+
+        /* How many GPU resets happened since the driver was proved, and how
+         * many were caused by this context.
+         */
+        uint32_t global_reset_count;
+        uint32_t context_reset_count;
+
         /**
          * If a compute job writes a resource read by a non-compute stage we
          * should sync on the last compute job.
@@ -624,12 +705,11 @@ struct v3d_context {
         uint32_t n_primitives_generated_queries_in_flight;
 
         struct pipe_poly_stipple stipple;
-        struct pipe_clip_state clip;
         struct pipe_viewport_state viewport;
-        struct v3d_ssbo_stateobj ssbo[PIPE_SHADER_TYPES];
-        struct v3d_shaderimg_stateobj shaderimg[PIPE_SHADER_TYPES];
-        struct v3d_constbuf_stateobj constbuf[PIPE_SHADER_TYPES];
-        struct v3d_texture_stateobj tex[PIPE_SHADER_TYPES];
+        struct v3d_ssbo_stateobj ssbo[MESA_SHADER_STAGES];
+        struct v3d_shaderimg_stateobj shaderimg[MESA_SHADER_STAGES];
+        struct v3d_constbuf_stateobj constbuf[MESA_SHADER_STAGES];
+        struct v3d_texture_stateobj tex[MESA_SHADER_STAGES];
         struct v3d_vertexbuf_stateobj vertexbuf;
         struct v3d_streamout_stateobj streamout;
         struct v3d_bo *current_oq;
@@ -671,13 +751,15 @@ struct v3d_depth_stencil_alpha_state {
 struct v3d_blend_state {
         struct pipe_blend_state base;
 
+        bool use_software;
+
         /* Per-RT mask of whether blending is enabled. */
         uint8_t blend_enables;
 };
 
 #define perf_debug(...) do {                            \
         if (V3D_DBG(PERF))                            \
-                fprintf(stderr, __VA_ARGS__);           \
+                mesa_logw(__VA_ARGS__);           \
         if (unlikely(v3d->base.debug.debug_message))         \
                 util_debug_message(&v3d->base.debug, PERF_INFO, __VA_ARGS__); \
 } while (0)
@@ -724,15 +806,6 @@ void v3d_program_init(struct pipe_context *pctx);
 void v3d_program_fini(struct pipe_context *pctx);
 void v3d_query_init(struct pipe_context *pctx);
 
-static inline int
-v3d_ioctl(int fd, unsigned long request, void *arg)
-{
-        if (using_v3d_simulator)
-                return v3d_simulator_ioctl(fd, request, arg);
-        else
-                return drmIoctl(fd, request, arg);
-}
-
 static inline bool
 v3d_transform_feedback_enabled(struct v3d_context *v3d)
 {
@@ -745,7 +818,7 @@ void v3d_set_shader_uniform_dirty_flags(struct v3d_compiled_shader *shader);
 struct v3d_cl_reloc v3d_write_uniforms(struct v3d_context *v3d,
                                        struct v3d_job *job,
                                        struct v3d_compiled_shader *shader,
-                                       enum pipe_shader_type stage);
+                                       mesa_shader_stage stage);
 
 void v3d_flush(struct pipe_context *pctx);
 void v3d_job_init(struct v3d_context *v3d);
@@ -753,7 +826,7 @@ struct v3d_job *v3d_job_create(struct v3d_context *v3d);
 void v3d_job_free(struct v3d_context *v3d, struct v3d_job *job);
 struct v3d_job *v3d_get_job(struct v3d_context *v3d,
                             uint32_t nr_cbufs,
-                            struct pipe_surface **cbufs,
+                            struct pipe_surface *cbufs,
                             struct pipe_surface *zsbuf,
                             struct pipe_surface *bbuf);
 struct v3d_job *v3d_get_job_for_fbo(struct v3d_context *v3d);
@@ -773,24 +846,29 @@ void v3d_flush_jobs_reading_resource(struct v3d_context *v3d,
 void v3d_update_compiled_shaders(struct v3d_context *v3d, uint8_t prim_mode);
 void v3d_update_compiled_cs(struct v3d_context *v3d);
 
+bool v3d_rt_format_is_emulated(enum pipe_format f);
 bool v3d_rt_format_supported(const struct v3d_device_info *devinfo,
                              enum pipe_format f);
 bool v3d_tex_format_supported(const struct v3d_device_info *devinfo,
                               enum pipe_format f);
-uint8_t v3d_get_rt_format(const struct v3d_device_info *devinfo, enum pipe_format f);
-uint8_t v3d_get_tex_format(const struct v3d_device_info *devinfo, enum pipe_format f);
+
 uint8_t v3d_get_tex_return_size(const struct v3d_device_info *devinfo,
                                 enum pipe_format f);
 uint8_t v3d_get_tex_return_channels(const struct v3d_device_info *devinfo,
                                     enum pipe_format f);
 const uint8_t *v3d_get_format_swizzle(const struct v3d_device_info *devinfo,
                                       enum pipe_format f);
-bool v3d_format_supports_tlb_msaa_resolve(const struct v3d_device_info *devinfo,
-                                          enum pipe_format f);
+bool v3d_format_supports_tlb_resolve_and_blend(const struct v3d_device_info *devinfo,
+                                               enum pipe_format f);
+bool v3d_format_needs_tlb_rb_swap(enum pipe_format format);
+void v3d_format_get_internal_type_and_bpp(const struct v3d_device_info *devinfo,
+                                          enum pipe_format format,
+                                          uint8_t *internal_type,
+                                          uint8_t *internal_bpp);
 
 void v3d_init_query_functions(struct v3d_context *v3d);
 void v3d_blit(struct pipe_context *pctx, const struct pipe_blit_info *blit_info);
-void v3d_blitter_save(struct v3d_context *v3d, bool op_blit,  bool render_cond);
+void v3d_blitter_save(struct v3d_context *v3d, enum v3d_blitter_op op);
 bool v3d_generate_mipmap(struct pipe_context *pctx,
                          struct pipe_resource *prsc,
                          enum pipe_format format,
@@ -820,13 +898,13 @@ float v3d_get_real_line_width(struct v3d_context *v3d);
 void v3d_ensure_prim_counts_allocated(struct v3d_context *ctx);
 
 void v3d_flag_dirty_sampler_state(struct v3d_context *v3d,
-                                  enum pipe_shader_type shader);
+                                  mesa_shader_stage shader);
 
 void v3d_get_tile_buffer_size(const struct v3d_device_info *devinfo,
                               bool is_msaa,
                               bool double_buffer,
                               uint32_t nr_cbufs,
-                              struct pipe_surface **cbufs,
+                              struct pipe_surface *cbufs,
                               struct pipe_surface *bbuf,
                               uint32_t *tile_width,
                               uint32_t *tile_height,
@@ -846,22 +924,6 @@ void v3d_disk_cache_store(struct v3d_context *v3d,
                           uint64_t *qpu_insts,
                           uint32_t qpu_size);
 #endif /* ENABLE_SHADER_CACHE */
-
-/* Helper to call hw ver specific functions */
-#define v3d_X(devinfo, thing) ({                                \
-        __typeof(&v3d42_##thing) v3d_X_thing;                   \
-        switch (devinfo->ver) {                                 \
-        case 42:                                                \
-                v3d_X_thing = &v3d42_##thing;                   \
-                break;                                          \
-        case 71:                                                \
-                v3d_X_thing = &v3d71_##thing;                   \
-                break;                                          \
-        default:                                                \
-                unreachable("Unsupported hardware generation"); \
-        }                                                       \
-        v3d_X_thing;                                            \
-})
 
 #ifdef v3dX
 #  include "v3dx_context.h"

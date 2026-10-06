@@ -20,13 +20,15 @@
 #include <sys/mman.h>
 
 #include "svga_cmd.h"
-#include "svga3d_caps.h"
+#include "svga3d_devcaps.h"
+#include "vmw_surf_defs.h"
 
 #include "c11/threads.h"
 #include "util/os_file.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/u_bitmask.h"
 #include "pipebuffer/pb_buffer.h"
 #include "pipebuffer/pb_bufmgr.h"
 #include "svga_winsys.h"
@@ -39,7 +41,6 @@
 #include "vmw_shader.h"
 #include "vmw_query.h"
 #include "vmwgfx_drm.h"
-#include "svga3d_surfacedefs.h"
 #include "xf86drm.h"
 
 /**
@@ -362,7 +363,7 @@ vmw_svga_winsys_buffer_create(struct svga_winsys_screen *sws,
 
    if (usage == SVGA_BUFFER_USAGE_PINNED) {
       if (vws->pools.query_fenced == NULL && !vmw_query_pools_init(vws))
-	 return NULL;
+         return NULL;
       provider = vws->pools.query_fenced;
    } else if (usage == SVGA_BUFFER_USAGE_SHADER) {
       provider = vws->pools.dma_slab_fenced;
@@ -375,7 +376,7 @@ vmw_svga_winsys_buffer_create(struct svga_winsys_screen *sws,
    assert(provider);
    buffer = provider->create_buffer(provider, size, &desc.pb_desc);
 
-   if(!buffer && provider == vws->pools.dma_fenced) {
+   if (!buffer && provider == vws->pools.dma_fenced) {
 
       assert(provider);
       provider = vws->pools.dma_slab_fenced;
@@ -457,6 +458,38 @@ vmw_svga_winsys_fence_server_sync(struct svga_winsys_screen *sws,
    return sync_accumulate("vmwgfx", context_fd, fd);
 }
 
+static enum pipe_error
+vmw_svga_define_gb_surface_cmd(struct svga_winsys_screen *sws,
+                               struct svga_winsys_context *swc,
+                               uint32 sid,
+                               SVGA3dSurfaceAllFlags surfaceFlags,
+                               SVGA3dSurfaceFormat format,
+                               uint32 numMipLevels,
+                               uint32 multisampleCount,
+                               SVGA3dMSPattern multisamplePattern,
+                               SVGA3dMSQualityLevel qualityLevel,
+                               SVGA3dTextureFilter autogenFilter,
+                               SVGA3dSize size,
+                               uint32 arraySize,
+                               uint32 bufferByteStride)
+{
+   assert(arraySize > 0);
+   if (sws->have_sm5)
+      return SVGA3D_DefineGBSurface_v4(swc, sid, surfaceFlags, format,
+                                       numMipLevels, multisampleCount,
+                                       multisamplePattern, qualityLevel,
+                                       autogenFilter, size, arraySize,
+                                       bufferByteStride);
+   else if (sws->have_sm4_1)
+      return SVGA3D_DefineGBSurface_v3(swc, sid, surfaceFlags, format,
+                                       numMipLevels, multisampleCount,
+                                       multisamplePattern, qualityLevel,
+                                       autogenFilter, size, arraySize);
+   else
+      return SVGA3D_DefineGBSurface_v2(swc, sid, surfaceFlags, format,
+                                       numMipLevels, multisampleCount,
+                                       autogenFilter, size, arraySize);
+}
 
 static struct svga_winsys_surface *
 vmw_svga_winsys_surface_create(struct svga_winsys_screen *sws,
@@ -479,7 +512,7 @@ vmw_svga_winsys_surface_create(struct svga_winsys_screen *sws,
 
    memset(&desc, 0, sizeof(desc));
    surface = CALLOC_STRUCT(vmw_svga_winsys_surface);
-   if(!surface)
+   if (!surface)
       goto no_surface;
 
    pipe_reference_init(&surface->refcnt, 1);
@@ -505,10 +538,10 @@ vmw_svga_winsys_surface_create(struct svga_winsys_screen *sws,
     * Used for the backing buffer GB surfaces, and to approximate
     * when to flush on non-GB hosts.
     */
-   buffer_size = svga3dsurface_get_serialized_size_extended(format, size,
-                                                            numMipLevels,
-                                                            numLayers,
-                                                            num_samples);
+   buffer_size = vmw_surf_get_serialized_size_extended(format, size,
+                                                       numMipLevels,
+                                                       numLayers,
+                                                       num_samples);
    if (flags & SVGA3D_SURFACE_BIND_STREAM_OUTPUT)
       buffer_size += sizeof(SVGA3dDXSOState);
 
@@ -516,7 +549,41 @@ vmw_svga_winsys_surface_create(struct svga_winsys_screen *sws,
       goto no_sid;
    }
 
-   if (sws->have_gb_objects) {
+   if (vmw_has_userspace_surface(vws)) {
+      struct svga_winsys_context *swc = vws->swc;
+      struct pb_buffer *pb_buf;
+
+      surface->sid = vmw_swc_surface_add_userspace_id(swc);
+      if (surface->sid == UTIL_BITMASK_INVALID_INDEX)
+         goto no_sid;
+
+      if (vmw_svga_define_gb_surface_cmd(sws, swc, surface->sid, flags, format,
+          numMipLevels, sampleCount, multisample_pattern, quality_level,
+          SVGA3D_TEX_FILTER_NONE, size, numLayers, 0) != PIPE_OK) {
+            vmw_swc_surface_clear_userspace_id(swc, surface->sid);
+            goto no_sid;
+      }
+
+      desc.pb_desc.alignment = 4096;
+      desc.pb_desc.usage = VMW_BUFFER_USAGE_SHARED;
+      surface->size = buffer_size;
+      pb_buf = provider->create_buffer(provider, surface->size,
+                                       &desc.pb_desc);
+      surface->buf = vmw_svga_winsys_buffer_wrap(pb_buf);
+
+      if (surface->buf == NULL) {
+         vmw_svga_winsys_userspace_surface_destroy(swc, surface->sid);
+         goto no_sid;
+      }
+
+      if (SVGA3D_BindGBSurface(swc, svga_winsys_surface(surface)) != PIPE_OK) {
+         vmw_svga_winsys_buffer_destroy(sws, surface->buf);
+         vmw_svga_winsys_userspace_surface_destroy(swc, surface->sid);
+         goto no_sid;
+      }
+
+      swc->flush(swc, NULL);
+   } else if (sws->have_gb_objects) {
       struct pb_buffer *pb_buf;
 
       surface->sid = vmw_ioctl_gb_surface_create(vws, flags, format, usage,
@@ -548,7 +615,7 @@ vmw_svga_winsys_surface_create(struct svga_winsys_screen *sws,
       surface->sid = vmw_ioctl_surface_create(vws, (SVGA3dSurface1Flags)flags,
                                               format, usage, size, numLayers,
                                               numMipLevels, sampleCount);
-      if(surface->sid == SVGA3D_INVALID_ID)
+      if (surface->sid == SVGA3D_INVALID_ID)
          goto no_sid;
 
       /* Best estimate for surface size, used for early flushing. */
@@ -578,14 +645,14 @@ vmw_svga_winsys_surface_can_create(struct svga_winsys_screen *sws,
    struct vmw_winsys_screen *vws = vmw_winsys_screen(sws);
    uint32_t buffer_size;
 
-   buffer_size = svga3dsurface_get_serialized_size(format, size,
-                                                   numMipLevels,
-                                                   numLayers);
+   buffer_size = vmw_surf_get_serialized_size(format, size,
+                                              numMipLevels,
+                                              numLayers);
    if (numSamples > 1)
       buffer_size *= numSamples;
 
    if (buffer_size > vws->ioctl.max_texture_size) {
-	return false;
+      return false;
    }
    return true;
 }
@@ -602,8 +669,8 @@ vmw_svga_winsys_surface_is_flushed(struct svga_winsys_screen *sws,
 
 static void
 vmw_svga_winsys_surface_ref(struct svga_winsys_screen *sws,
-			    struct svga_winsys_surface **pDst,
-			    struct svga_winsys_surface *src)
+                            struct svga_winsys_surface **pDst,
+                            struct svga_winsys_surface *src)
 {
    struct vmw_svga_winsys_surface *d_vsurf = vmw_svga_winsys_surface(*pDst);
    struct vmw_svga_winsys_surface *s_vsurf = vmw_svga_winsys_surface(src);
@@ -652,24 +719,24 @@ vmw_svga_winsys_get_cap(struct svga_winsys_screen *sws,
 
 struct svga_winsys_gb_shader *
 vmw_svga_winsys_shader_create(struct svga_winsys_screen *sws,
-			      SVGA3dShaderType type,
-			      const uint32 *bytecode,
-			      uint32 bytecodeLen)
+                              SVGA3dShaderType type,
+                              const uint32 *bytecode,
+                              uint32 bytecodeLen)
 {
    struct vmw_winsys_screen *vws = vmw_winsys_screen(sws);
    struct vmw_svga_winsys_shader *shader;
    void *code;
 
    shader = CALLOC_STRUCT(vmw_svga_winsys_shader);
-   if(!shader)
+   if (!shader)
       goto out_no_shader;
 
    pipe_reference_init(&shader->refcnt, 1);
    p_atomic_set(&shader->validated, 0);
    shader->screen = vws;
    shader->buf = vmw_svga_winsys_buffer_create(sws, 64,
-					       SVGA_BUFFER_USAGE_SHADER,
-					       bytecodeLen);
+                                               SVGA_BUFFER_USAGE_SHADER,
+                                               bytecodeLen);
    if (!shader->buf)
       goto out_no_buf;
 
@@ -698,7 +765,7 @@ out_no_shader:
 
 void
 vmw_svga_winsys_shader_destroy(struct svga_winsys_screen *sws,
-			       struct svga_winsys_gb_shader *shader)
+                               struct svga_winsys_gb_shader *shader)
 {
    struct vmw_svga_winsys_shader *d_shader =
       vmw_svga_winsys_shader(shader);

@@ -10,37 +10,21 @@
 
 #include "genxml/gen_macros.h"
 
-#include "pan_pool.h"
+struct panvk_cmd_buffer;
+struct panvk_shader_variant;
 
-#define MAX_PUSH_CONSTANTS_SIZE 128
+#define MAX_PUSH_CONSTANTS_SIZE 256
 
 struct panvk_push_constant_state {
-   uint8_t data[MAX_PUSH_CONSTANTS_SIZE];
+   uint64_t data[MAX_PUSH_CONSTANTS_SIZE / sizeof(uint64_t)];
 };
 
-static inline mali_ptr
-panvk_cmd_prepare_push_uniforms(struct pan_pool *desc_pool_base,
-                                struct panvk_push_constant_state *push,
-                                void *sysvals, unsigned sysvals_sz)
-{
-   struct panfrost_ptr push_uniforms =
-      pan_pool_alloc_aligned(desc_pool_base, 512, 16);
+VkResult panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
+   struct pan_ptr *push_uniforms, uint32_t repeat_count);
 
-   /* The first half is used for push constants. */
-   memcpy(push_uniforms.cpu, push->data, sizeof(push->data));
-
-   /* The second half is used for sysvals. */
-   memcpy((uint8_t *)push_uniforms.cpu + 256, sysvals, sysvals_sz);
-
-   return push_uniforms.gpu;
-}
-
-static inline void
-panvk_cmd_push_constants(struct panvk_push_constant_state *push,
-                         VkShaderStageFlags stages, uint32_t offset,
-                         uint32_t size, const void *values)
-{
-   memcpy(push->data + offset, values, size);
-}
+VkResult panvk_per_arch(cmd_prepare_compute_push_uniforms)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
+   struct pan_ptr *push_uniforms);
 
 #endif

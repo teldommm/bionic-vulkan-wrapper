@@ -36,8 +36,6 @@
 extern "C" {
 #endif
 
-struct __DRIextensionRec;
-
 /* Helpers to figure out driver and device name, eg. from pci-id, etc. */
 
 int
@@ -49,6 +47,11 @@ loader_get_kernel_driver_name(int fd);
 int
 loader_open_render_node_platform_device(const char * const drivers[],
                                         unsigned int n_drivers);
+
+int *
+loader_open_render_node_platform_devices(const char * const drivers[],
+                                         unsigned int n_drivers,
+                                         unsigned int *n_devices);
 
 bool
 loader_is_device_render_capable(int fd);

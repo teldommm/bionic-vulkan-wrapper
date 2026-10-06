@@ -6,6 +6,8 @@
 #define NVKMD_H 1
 
 #include "nv_device_info.h"
+#include "util/list.h"
+#include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 
 #include "../nvk_debug.h"
@@ -51,13 +53,30 @@ enum nvkmd_mem_flags {
 
    /** This memory object may be shared with other processes */
    NVKMD_MEM_SHARED     = 1 << 4,
+
+   /** This memory object has coherent CPU maps */
+   NVKMD_MEM_COHERENT   = 1 << 5,
 };
+
+#define NVKMD_MEM_PLACEMENT_FLAGS \
+   (NVKMD_MEM_LOCAL | NVKMD_MEM_GART | NVKMD_MEM_VRAM)
 
 enum nvkmd_mem_map_flags {
    NVKMD_MEM_MAP_RD     = 1 << 0,
    NVKMD_MEM_MAP_WR     = 1 << 1,
    NVKMD_MEM_MAP_RDWR   = NVKMD_MEM_MAP_RD | NVKMD_MEM_MAP_WR,
-   NVKMD_MEM_MAP_FIXED  = 1 << 2,
+
+   /** Create a client mapping
+    *
+    * This sets nvkmd_mem::client_map instead of nvkmd_mem::map.  These
+    * mappings may be different from internal mappings and have different
+    * rules.  Only one client mapping may exist at a time but internal
+    * mappings are reference counted.  Only client mappings can be used with
+    * MAP_FIXED or unmapped with nvkmd_mem_overmap().
+    */
+   NVKMD_MEM_MAP_CLIENT = 1 << 2,
+
+   NVKMD_MEM_MAP_FIXED  = 1 << 3,
 };
 
 enum nvkmd_va_flags {
@@ -101,6 +120,7 @@ struct nvkmd_info {
    bool has_alloc_tiled;
    bool has_map_fixed;
    bool has_overmap;
+   bool has_compression;
 };
 
 struct nvkmd_pdev_ops {
@@ -177,6 +197,14 @@ struct nvkmd_dev_ops {
 struct nvkmd_dev {
    const struct nvkmd_dev_ops *ops;
    struct nvkmd_pdev *pdev;
+
+   /* Start and end of the usable VA space.  All nvkmd_va objects will be
+    * allocated within this range.
+    */
+   uint64_t va_start, va_end;
+
+   struct list_head mems;
+   simple_mtx_t mems_mutex;
 };
 
 struct nvkmd_mem_ops {
@@ -185,12 +213,23 @@ struct nvkmd_mem_ops {
    VkResult (*map)(struct nvkmd_mem *mem,
                    struct vk_object_base *log_obj,
                    enum nvkmd_mem_map_flags flags,
-                   void *fixed_addr);
+                   void *fixed_addr,
+                   void **map_out);
 
-   void (*unmap)(struct nvkmd_mem *mem);
+   void (*unmap)(struct nvkmd_mem *mem,
+                 enum nvkmd_mem_map_flags flags,
+                 void *map);
 
    VkResult (*overmap)(struct nvkmd_mem *mem,
-                       struct vk_object_base *log_obj);
+                       struct vk_object_base *log_obj,
+                       enum nvkmd_mem_map_flags flags,
+                       void *map);
+
+   void (*sync_to_gpu)(struct nvkmd_mem *mem,
+                       uint64_t offset_B, uint64_t range_B);
+
+   void (*sync_from_gpu)(struct nvkmd_mem *mem,
+                         uint64_t offset_B, uint64_t range_B);
 
    VkResult (*export_dma_buf)(struct nvkmd_mem *mem,
                               struct vk_object_base *log_obj,
@@ -204,6 +243,9 @@ struct nvkmd_mem {
    const struct nvkmd_mem_ops *ops;
    struct nvkmd_dev *dev;
 
+   /* Optional link in nvkmd_dev::mems */
+   struct list_head link;
+
    uint32_t refcnt;
 
    enum nvkmd_mem_flags flags;
@@ -211,8 +253,20 @@ struct nvkmd_mem {
 
    uint64_t size_B;
    struct nvkmd_va *va;
+
+   simple_mtx_t map_mutex;
+   uint32_t map_cnt;
    void *map;
+
+   void *client_map;
 };
+
+void nvkmd_mem_init(struct nvkmd_dev *dev,
+                    struct nvkmd_mem *mem,
+                    const struct nvkmd_mem_ops *ops,
+                    enum nvkmd_mem_flags flags,
+                    uint64_t size_B,
+                    uint32_t bind_align_B);
 
 struct nvkmd_va_ops {
    void (*free)(struct nvkmd_va *va);
@@ -243,6 +297,11 @@ struct nvkmd_va {
 struct nvkmd_ctx_exec {
    uint64_t addr;
    uint32_t size_B;
+   /* True if this push ends in an incomplete method and requires the next
+    * push to provide the method data.  In this case, this push and the next
+    * one must be in the same submit ioctl.
+    */
+   bool incomplete;
    bool no_prefetch;
 };
 
@@ -375,27 +434,20 @@ nvkmd_dev_get_drm_fd(struct nvkmd_dev *dev)
    return dev->ops->get_drm_fd(dev);
 }
 
-static inline VkResult MUST_CHECK
+VkResult MUST_CHECK
 nvkmd_dev_alloc_mem(struct nvkmd_dev *dev,
                     struct vk_object_base *log_obj,
                     uint64_t size_B, uint64_t align_B,
                     enum nvkmd_mem_flags flags,
-                    struct nvkmd_mem **mem_out)
-{
-   return dev->ops->alloc_mem(dev, log_obj, size_B, align_B, flags, mem_out);
-}
+                    struct nvkmd_mem **mem_out);
 
-static inline VkResult MUST_CHECK
+VkResult MUST_CHECK
 nvkmd_dev_alloc_tiled_mem(struct nvkmd_dev *dev,
                           struct vk_object_base *log_obj,
                           uint64_t size_B, uint64_t align_B,
                           uint8_t pte_kind, uint16_t tile_mode,
                           enum nvkmd_mem_flags flags,
-                          struct nvkmd_mem **mem_out)
-{
-   return dev->ops->alloc_tiled_mem(dev, log_obj, size_B, align_B,
-                                    pte_kind, tile_mode, flags, mem_out);
-}
+                          struct nvkmd_mem **mem_out);
 
 /* Implies NVKMD_MEM_CAN_MAP */
 VkResult MUST_CHECK
@@ -406,13 +458,15 @@ nvkmd_dev_alloc_mapped_mem(struct nvkmd_dev *dev,
                            enum nvkmd_mem_map_flags map_flags,
                            struct nvkmd_mem **mem_out);
 
-static inline VkResult MUST_CHECK
+VkResult MUST_CHECK
 nvkmd_dev_import_dma_buf(struct nvkmd_dev *dev,
                          struct vk_object_base *log_obj,
-                         int fd, struct nvkmd_mem **mem_out)
-{
-   return dev->ops->import_dma_buf(dev, log_obj, fd, mem_out);
-}
+                         int fd, struct nvkmd_mem **mem_out);
+
+struct nvkmd_mem *
+nvkmd_dev_lookup_mem_by_va(struct nvkmd_dev *dev,
+                           uint64_t addr,
+                           uint64_t *offset_out);
 
 VkResult MUST_CHECK
 nvkmd_dev_alloc_va(struct nvkmd_dev *dev,
@@ -439,37 +493,58 @@ nvkmd_mem_ref(struct nvkmd_mem *mem)
 
 void nvkmd_mem_unref(struct nvkmd_mem *mem);
 
-static inline VkResult MUST_CHECK
+VkResult MUST_CHECK
 nvkmd_mem_map(struct nvkmd_mem *mem, struct vk_object_base *log_obj,
               enum nvkmd_mem_map_flags flags, void *fixed_addr,
-              void **map_out)
+              void **map_out);
+
+void nvkmd_mem_unmap(struct nvkmd_mem *mem, enum nvkmd_mem_map_flags flags);
+
+static inline VkResult MUST_CHECK
+nvkmd_mem_overmap(struct nvkmd_mem *mem, struct vk_object_base *log_obj,
+                  enum nvkmd_mem_map_flags flags)
 {
-   assert(mem->map == NULL);
+   assert(flags & NVKMD_MEM_MAP_CLIENT);
+   assert(mem->client_map != NULL);
 
-   VkResult result = mem->ops->map(mem, log_obj, flags, fixed_addr);
-   if (result != VK_SUCCESS)
-      return result;
+   VkResult result = mem->ops->overmap(mem, log_obj, flags, mem->client_map);
+   if (result == VK_SUCCESS)
+      mem->client_map = NULL;
 
-   *map_out = mem->map;
+   return result;
+}
 
-   return VK_SUCCESS;
+void nvkmd_mem_sync_to_gpu(struct nvkmd_mem *mem, bool client_map,
+                           uint64_t offset_B, uint64_t range_B);
+void nvkmd_mem_sync_from_gpu(struct nvkmd_mem *mem, bool client_map,
+                             uint64_t offset_B, uint64_t range_B);
+
+static inline void
+nvkmd_mem_sync_map_to_gpu(struct nvkmd_mem *mem,
+                          uint64_t offset_B, uint64_t range_B)
+{
+   nvkmd_mem_sync_to_gpu(mem, false, offset_B, range_B);
 }
 
 static inline void
-nvkmd_mem_unmap(struct nvkmd_mem *mem)
+nvkmd_mem_sync_client_map_to_gpu(struct nvkmd_mem *mem,
+                                 uint64_t offset_B, uint64_t range_B)
 {
-   assert(mem->map != NULL);
-   mem->ops->unmap(mem);
-   assert(mem->map == NULL);
+   nvkmd_mem_sync_to_gpu(mem, true, offset_B, range_B);
 }
 
-static inline VkResult MUST_CHECK
-nvkmd_mem_overmap(struct nvkmd_mem *mem, struct vk_object_base *log_obj)
+static inline void
+nvkmd_mem_sync_map_from_gpu(struct nvkmd_mem *mem,
+                            uint64_t offset_B, uint64_t range_B)
 {
-   assert(mem->map != NULL);
-   VkResult result = mem->ops->overmap(mem, log_obj);
-   assert(mem->map == NULL);
-   return result;
+   nvkmd_mem_sync_from_gpu(mem, false, offset_B, range_B);
+}
+
+static inline void
+nvkmd_mem_sync_client_map_from_gpu(struct nvkmd_mem *mem,
+                                   uint64_t offset_B, uint64_t range_B)
+{
+   nvkmd_mem_sync_from_gpu(mem, true, offset_B, range_B);
 }
 
 static inline VkResult MUST_CHECK
@@ -514,14 +589,11 @@ nvkmd_ctx_wait(struct nvkmd_ctx *ctx,
    return ctx->ops->wait(ctx, log_obj, wait_count, waits);
 }
 
-static inline VkResult MUST_CHECK
+VkResult MUST_CHECK
 nvkmd_ctx_exec(struct nvkmd_ctx *ctx,
                struct vk_object_base *log_obj,
                uint32_t exec_count,
-               const struct nvkmd_ctx_exec *execs)
-{
-   return ctx->ops->exec(ctx, log_obj, exec_count, execs);
-}
+               const struct nvkmd_ctx_exec *execs);
 
 VkResult MUST_CHECK
 nvkmd_ctx_bind(struct nvkmd_ctx *ctx,

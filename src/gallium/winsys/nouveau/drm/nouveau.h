@@ -52,14 +52,8 @@ struct nouveau_device {
    uint64_t vram_limit;
    uint64_t gart_limit;
 
-   /* only pci info and device type are set */
+   /* only pci info, class ids and and device type are set */
    struct nv_device_info info;
-
-   /* classes for common push buf dumping */
-   uint32_t cls_eng3d;
-   uint32_t cls_compute;
-   uint32_t cls_m2mf;
-   uint32_t cls_copy;
 };
 
 struct nouveau_client {
@@ -111,7 +105,10 @@ struct nouveau_pushbuf {
    struct nouveau_client *client;
    struct nouveau_object *channel;
    struct nouveau_bufctx *bufctx;
-   void (*kick_notify)(struct nouveau_pushbuf *);
+
+   /** Returns false on error */
+   MUST_CHECK bool (*kick_notify)(struct nouveau_pushbuf *);
+
    void *user_priv;
    uint32_t rsvd_kick;
    uint32_t flags;

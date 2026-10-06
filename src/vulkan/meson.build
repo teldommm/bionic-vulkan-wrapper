@@ -55,7 +55,7 @@ if with_platform_wayland
   vulkan_wsi_list += '-DVK_USE_PLATFORM_WAYLAND_KHR'
 endif
 if system_has_kms_drm and not with_platform_android
-  vulkan_wsi_deps += [dep_libdrm]
+  vulkan_wsi_deps += [dep_libdrm, dep_display_info]
   vulkan_wsi_list += '-DVK_USE_PLATFORM_DISPLAY_KHR'
 endif
 if with_xlib_lease
@@ -68,9 +68,13 @@ endif
 if with_platform_windows
   vulkan_wsi_list += '-DVK_USE_PLATFORM_WIN32_KHR'
 endif
-if host_machine.system() == 'darwin'
+if with_platform_macos
   vulkan_wsi_list += '-DVK_USE_PLATFORM_MACOS_MVK'
   vulkan_wsi_list += '-DVK_USE_PLATFORM_METAL_EXT'
+  vulkan_wsi_deps += dependency(
+    'appleframeworks',
+    modules : ['QuartzCore', 'Metal']
+  )
 endif
 
 idep_vulkan_wsi_defines = declare_dependency(
@@ -87,6 +91,15 @@ if with_vulkan_overlay_layer
 endif
 if with_vulkan_device_select_layer
   subdir('device-select-layer')
+endif
+if with_vulkan_screenshot_layer
+  subdir('screenshot-layer')
+endif
+if with_vulkan_vram_report_limit_layer
+  subdir('vram-report-limit-layer')
+endif
+if with_vulkan_anti_lag_layer
+  subdir('anti-lag-layer')
 endif
 if with_wrapper_vk
   subdir('wrapper')

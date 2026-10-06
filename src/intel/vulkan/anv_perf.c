@@ -31,7 +31,7 @@
 #include "perf/intel_perf.h"
 #include "perf/intel_perf_mdapi.h"
 
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 
 void
 anv_physical_device_init_perf(struct anv_physical_device *device, int fd)
@@ -76,7 +76,7 @@ anv_physical_device_init_perf(struct anv_physical_device *device, int fd)
          device->n_perf_query_commands += field->size / 4;
          break;
       default:
-         unreachable("Unhandled register type");
+         UNREACHABLE("Unhandled register type");
       }
    }
    device->n_perf_query_commands *= 2; /* Begin & End */
@@ -95,12 +95,23 @@ anv_device_perf_init(struct anv_device *device)
    device->perf_queue = NULL;
 }
 
-static int
-anv_device_perf_open(struct anv_device *device, struct anv_queue *queue, uint64_t metric_id)
+void
+anv_device_perf_close(struct anv_device *device)
 {
+   if (device->perf_fd == -1)
+      return;
+
+   if (intel_bind_timeline_get_syncobj(&device->perf_timeline))
+      intel_bind_timeline_finish(&device->perf_timeline, device->fd);
+   close(device->perf_fd);
+   device->perf_fd = -1;
+}
+
+static uint32_t
+anv_device_perf_get_queue_context_or_exec_queue_id(struct anv_queue *queue)
+{
+   struct anv_device *device = queue->device;
    uint32_t context_or_exec_queue_id;
-   uint64_t period_exponent = 31; /* slowest sampling period */
-   int ret;
 
    switch (device->physical->info.kmd_type) {
    case INTEL_KMD_TYPE_I915:
@@ -111,15 +122,32 @@ anv_device_perf_open(struct anv_device *device, struct anv_queue *queue, uint64_
       context_or_exec_queue_id = queue->exec_queue_id;
       break;
    default:
-      unreachable("missing");
+      UNREACHABLE("missing");
       context_or_exec_queue_id = 0;
    }
 
+   return context_or_exec_queue_id;
+}
+
+static int
+anv_device_perf_open(struct anv_device *device, struct anv_queue *queue, uint64_t metric_id)
+{
+   uint64_t period_exponent = 31; /* slowest sampling period */
+   int ret;
+
+   if (intel_perf_has_metric_sync(device->physical->perf)) {
+      if (!intel_bind_timeline_init(&device->perf_timeline, device->fd))
+         return -1;
+   }
+
    ret = intel_perf_stream_open(device->physical->perf, device->fd,
-                                context_or_exec_queue_id, metric_id,
-                                period_exponent, true, true);
+                                anv_device_perf_get_queue_context_or_exec_queue_id(queue),
+                                metric_id, period_exponent, true, true,
+                                &device->perf_timeline);
    if (ret >= 0)
       device->perf_queue = queue;
+   else
+      intel_bind_timeline_finish(&device->perf_timeline, device->fd);
 
    return ret;
 }
@@ -193,24 +221,12 @@ VkResult anv_AcquirePerformanceConfigurationINTEL(
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    if (!INTEL_DEBUG(DEBUG_NO_OACONFIG)) {
-      config->register_config =
-         intel_perf_load_configuration(device->physical->perf, device->fd,
-                                     INTEL_PERF_QUERY_GUID_MDAPI);
-      if (!config->register_config) {
+      config->config_id = intel_perf_get_configuration_id(device->physical->perf,
+                                                          INTEL_PERF_QUERY_GUID_MDAPI);
+      if (config->config_id == 0) {
          vk_object_free(&device->vk, NULL, config);
          return VK_INCOMPLETE;
       }
-
-      uint64_t ret =
-         intel_perf_store_configuration(device->physical->perf, device->fd,
-                                      config->register_config, NULL /* guid */);
-      if (ret == 0) {
-         ralloc_free(config->register_config);
-         vk_object_free(&device->vk, NULL, config);
-         return VK_INCOMPLETE;
-      }
-
-      config->config_id = ret;
    }
 
    *pConfiguration = anv_performance_configuration_intel_to_handle(config);
@@ -227,8 +243,6 @@ VkResult anv_ReleasePerformanceConfigurationINTEL(
 
    if (!INTEL_DEBUG(DEBUG_NO_OACONFIG))
       intel_perf_remove_configuration(device->physical->perf, device->fd, config->config_id);
-
-   ralloc_free(config->register_config);
 
    vk_object_free(&device->vk, NULL, config);
 
@@ -256,25 +270,35 @@ VkResult anv_QueueSetPerformanceConfigurationINTEL(
    ANV_FROM_HANDLE(anv_queue, queue, _queue);
    ANV_FROM_HANDLE(anv_performance_configuration_intel, config, _configuration);
    struct anv_device *device = queue->device;
+   VkResult result = VK_SUCCESS;
 
-   if (queue != anv_device_get_perf_queue(device))
-      return VK_ERROR_UNKNOWN;
+   vk_queue_lock(&queue->vk);
 
-   if (!INTEL_DEBUG(DEBUG_NO_OACONFIG)) {
-      if (device->perf_fd < 0) {
-         device->perf_fd = anv_device_perf_open(device, queue, config->config_id);
-         if (device->perf_fd < 0)
-            return VK_ERROR_INITIALIZATION_FAILED;
-      } else {
-         int ret = intel_perf_stream_set_metrics_id(device->physical->perf,
-                                                    device->perf_fd,
-                                                    config->config_id);
-         if (ret < 0)
-            return vk_device_set_lost(&device->vk, "i915-perf config failed: %m");
+   if (queue == anv_device_get_perf_queue(device)) {
+      if (!INTEL_DEBUG(DEBUG_NO_OACONFIG)) {
+         if (device->perf_fd < 0) {
+            device->perf_fd = anv_device_perf_open(device, queue, config->config_id);
+            if (device->perf_fd < 0)
+               result = VK_ERROR_INITIALIZATION_FAILED;
+         } else {
+            uint32_t context_or_exec_queue = anv_device_perf_get_queue_context_or_exec_queue_id(device->perf_queue);
+            int ret = intel_perf_stream_set_metrics_id(device->physical->perf,
+                                                       device->fd,
+                                                       device->perf_fd,
+                                                       context_or_exec_queue,
+                                                       config->config_id,
+                                                       &device->perf_timeline);
+            if (ret < 0)
+               result = vk_device_set_lost(&device->vk, "i915-perf config failed: %m");
+         }
       }
+   } else {
+      result = vk_error(device, VK_ERROR_UNKNOWN);
    }
 
-   return VK_SUCCESS;
+   vk_queue_unlock(&queue->vk);
+
+   return result;
 }
 
 void anv_UninitializePerformanceApiINTEL(
@@ -282,10 +306,7 @@ void anv_UninitializePerformanceApiINTEL(
 {
    ANV_FROM_HANDLE(anv_device, device, _device);
 
-   if (device->perf_fd >= 0) {
-      close(device->perf_fd);
-      device->perf_fd = -1;
-   }
+   anv_device_perf_close(device);
 }
 
 /* VK_KHR_performance_query */
@@ -352,11 +373,11 @@ VkResult anv_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
          counter->scope = VK_PERFORMANCE_COUNTER_SCOPE_COMMAND_KHR;
          counter->storage = intel_perf_counter_data_type_to_vk_storage[intel_counter->data_type];
 
-         unsigned char sha1_result[20];
-         _mesa_sha1_compute(intel_counter->symbol_name,
+         unsigned char blake3_result[BLAKE3_KEY_LEN];
+         _mesa_blake3_compute(intel_counter->symbol_name,
                             strlen(intel_counter->symbol_name),
-                            sha1_result);
-         memcpy(counter->uuid, sha1_result, sizeof(counter->uuid));
+                            blake3_result);
+         memcpy(counter->uuid, blake3_result, sizeof(counter->uuid));
       }
 
       vk_outarray_append_typed(VkPerformanceCounterDescriptionKHR, &out_desc, desc) {
@@ -422,11 +443,7 @@ void anv_ReleaseProfilingLockKHR(
 {
    ANV_FROM_HANDLE(anv_device, device, _device);
 
-   if (!INTEL_DEBUG(DEBUG_NO_OACONFIG)) {
-      assert(device->perf_fd >= 0);
-      close(device->perf_fd);
-   }
-   device->perf_fd = -1;
+   anv_device_perf_close(device);
 }
 
 void
@@ -468,12 +485,12 @@ anv_perf_write_pass_results(struct intel_perf_config *perf,
             break;
          default:
             /* So far we aren't using uint32, double or bool32... */
-            unreachable("unexpected counter data type");
+            UNREACHABLE("unexpected counter data type");
          }
          break;
 
       default:
-         unreachable("invalid query type");
+         UNREACHABLE("invalid query type");
       }
 
       /* The Vulkan extension only has nanoseconds as a unit */

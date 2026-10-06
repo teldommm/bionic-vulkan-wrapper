@@ -1,25 +1,7 @@
 COPYRIGHT = """\
 /*
  * Copyright (C) 2017 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 """
 
@@ -36,12 +18,12 @@ def collect_data(spirv, kind):
 
     values = {}
     for x in operands["enumerants"]:
-        name = x["enumerant"]
         val = x["value"]
-        if val not in values:
-            values[val] = [name]
-        else:
-            values[val].append(name)
+        assert(val not in values)
+        names = [x["enumerant"]]
+        if "aliases" in x:
+            names.extend(x["aliases"])
+        values[val] = names
 
     return (kind, list(values.values()), operands["category"])
 
@@ -49,15 +31,13 @@ def collect_opcodes(spirv):
     seen = set()
     values = []
     for x in spirv["instructions"]:
-        # Handle aliases by choosing the first one in the grammar.
-        # E.g. OpDecorateString and OpDecorateStringGOOGLE share same opcode.
-        if x["opcode"] in seen:
-            continue
         opcode = x["opcode"]
+        assert(opcode not in seen)
+        seen.add(opcode)
+
         name = x["opname"]
         assert name.startswith("Op")
         values.append([name[2:]])
-        seen.add(opcode)
 
     return ("Op", values, None)
 
@@ -146,7 +126,7 @@ spirv_capabilities_set(struct spirv_capabilities *caps,
    case SpvCapability${names[0]}: caps->${names[0]} = enabled; break;
     % endfor
    default:
-      unreachable("Unknown capability");
+      UNREACHABLE("Unknown capability");
    }
 }
 % endif

@@ -1,10 +1,9 @@
 .cache
 .vscode*
+*.kdev4
 *.pyc
 *.pyo
 *.out
 /build
 .venv/
-s3tc2.comp
-src/vulkan/wrapper/lib/
-.idea
+*.mda.tar

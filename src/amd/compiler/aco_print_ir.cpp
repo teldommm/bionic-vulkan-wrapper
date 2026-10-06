@@ -8,7 +8,7 @@
 #include "aco_ir.h"
 
 #include "common/ac_shader_util.h"
-#include "common/sid.h"
+#include "common/amdgfxregs.h"
 
 #include <array>
 
@@ -148,8 +148,25 @@ print_definition(const Definition* definition, FILE* output, unsigned flags)
 {
    if (!(flags & print_no_ssa))
       print_reg_class(definition->regClass(), output);
-   if (definition->isPrecise())
-      fprintf(output, "(precise)");
+
+   if (definition->isNoContract() || definition->isNoReassoc()) {
+      if (!definition->isNoContract())
+         fprintf(output, "(no-reassoc)");
+      else if (!definition->isNoReassoc())
+         fprintf(output, "(no-contract)");
+      else
+         fprintf(output, "(precise)");
+   }
+   if (definition->isInfPreserve() || definition->isNaNPreserve() || definition->isSZPreserve()) {
+      fprintf(output, "(");
+      if (definition->isSZPreserve())
+         fprintf(output, "Sz");
+      if (definition->isInfPreserve())
+         fprintf(output, "Inf");
+      if (definition->isNaNPreserve())
+         fprintf(output, "NaN");
+      fprintf(output, "Preserve)");
+   }
    if (definition->isNUW())
       fprintf(output, "(nuw)");
    if (definition->isNoCSE())
@@ -243,7 +260,7 @@ print_cache_flags(enum amd_gfx_level gfx_level, const T& instr, FILE* output)
             fprintf(output, " non_temporal");
          if (instr.cache.gfx12.temporal_hint & gfx12_atomic_accum_deferred_scope)
             fprintf(output, " accum_deferred_scope");
-      } else if (instr.definitions.empty()) {
+      } else if (!instr.definitions.empty()) {
          switch (instr.cache.gfx12.temporal_hint) {
          case gfx12_load_regular_temporal: break;
          case gfx12_load_non_temporal: fprintf(output, " non_temporal"); break;
@@ -341,32 +358,27 @@ print_instr_format_specific(enum amd_gfx_level gfx_level, const Instruction* ins
       case aco_opcode::s_wait_storecnt:
       case aco_opcode::s_wait_samplecnt:
       case aco_opcode::s_wait_bvhcnt:
-      case aco_opcode::s_wait_kmcnt: {
+      case aco_opcode::s_wait_kmcnt:
+      case aco_opcode::s_setprio: {
          fprintf(output, " imm:%u", imm);
          break;
       }
       case aco_opcode::s_waitcnt_depctr: {
-         unsigned va_vdst = (imm >> 12) & 0xf;
-         unsigned va_sdst = (imm >> 9) & 0x7;
-         unsigned va_ssrc = (imm >> 8) & 0x1;
-         unsigned hold_cnt = (imm >> 7) & 0x1;
-         unsigned vm_vsrc = (imm >> 2) & 0x7;
-         unsigned va_vcc = (imm >> 1) & 0x1;
-         unsigned sa_sdst = imm & 0x1;
-         if (va_vdst != 0xf)
-            fprintf(output, " va_vdst(%d)", va_vdst);
-         if (va_sdst != 0x7)
-            fprintf(output, " va_sdst(%d)", va_sdst);
-         if (va_ssrc != 0x1)
-            fprintf(output, " va_ssrc(%d)", va_ssrc);
-         if (hold_cnt != 0x1)
-            fprintf(output, " holt_cnt(%d)", hold_cnt);
-         if (vm_vsrc != 0x7)
-            fprintf(output, " vm_vsrc(%d)", vm_vsrc);
-         if (va_vcc != 0x1)
-            fprintf(output, " va_vcc(%d)", va_vcc);
-         if (sa_sdst != 0x1)
-            fprintf(output, " sa_sdst(%d)", sa_sdst);
+         depctr_wait wait = parse_depctr_wait(instr);
+         if (wait.va_vdst != 0xf)
+            fprintf(output, " va_vdst(%d)", wait.va_vdst);
+         if (wait.va_sdst != 0x7)
+            fprintf(output, " va_sdst(%d)", wait.va_sdst);
+         if (wait.va_ssrc != 0x1)
+            fprintf(output, " va_ssrc(%d)", wait.va_ssrc);
+         if (wait.hold_cnt != 0x1)
+            fprintf(output, " holt_cnt(%d)", wait.hold_cnt);
+         if (wait.vm_vsrc != 0x7)
+            fprintf(output, " vm_vsrc(%d)", wait.vm_vsrc);
+         if (wait.va_vcc != 0x1)
+            fprintf(output, " va_vcc(%d)", wait.va_vcc);
+         if (wait.sa_sdst != 0x1)
+            fprintf(output, " sa_sdst(%d)", wait.sa_sdst);
          break;
       }
       case aco_opcode::s_delay_alu: {
@@ -531,8 +543,11 @@ print_instr_format_specific(enum amd_gfx_level gfx_level, const Instruction* ins
    }
    case Format::MIMG: {
       const MIMG_instruction& mimg = instr->mimg();
-      unsigned identity_dmask =
-         !instr->definitions.empty() ? (1 << instr->definitions[0].size()) - 1 : 0xf;
+      unsigned identity_dmask = 0xf;
+      if (!instr->definitions.empty()) {
+         unsigned num_channels = instr->definitions[0].bytes() / (mimg.d16 ? 2 : 4);
+         identity_dmask = (1 << num_channels) - 1;
+      }
       if ((mimg.dmask & identity_dmask) != identity_dmask)
          fprintf(output, " dmask:%s%s%s%s", mimg.dmask & 0x1 ? "x" : "",
                  mimg.dmask & 0x2 ? "y" : "", mimg.dmask & 0x4 ? "z" : "",
@@ -589,6 +604,8 @@ print_instr_format_specific(enum amd_gfx_level gfx_level, const Instruction* ins
          fprintf(output, " null");
       else if (exp.dest >= V_008DFC_SQ_EXP_POS && exp.dest <= V_008DFC_SQ_EXP_POS + 3)
          fprintf(output, " pos%d", exp.dest - V_008DFC_SQ_EXP_POS);
+      else if (exp.dest == V_008DFC_SQ_EXP_PRIM)
+         fprintf(output, " prim");
       else if (exp.dest >= V_008DFC_SQ_EXP_PARAM && exp.dest <= V_008DFC_SQ_EXP_PARAM + 31)
          fprintf(output, " param%d", exp.dest - V_008DFC_SQ_EXP_PARAM);
       break;
@@ -632,6 +649,8 @@ print_instr_format_specific(enum amd_gfx_level gfx_level, const Instruction* ins
          fprintf(output, " nv");
       if (flat.disable_wqm)
          fprintf(output, " disable_wqm");
+      if (flat.may_use_lds)
+         fprintf(output, " may_use_lds");
       print_sync(flat.sync, output);
       break;
    }
@@ -816,7 +835,7 @@ print_vopd_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* o
 }
 
 static void
-print_block_kind(uint16_t kind, FILE* output)
+print_block_kind(uint32_t kind, FILE* output)
 {
    if (kind & block_kind_uniform)
       fprintf(output, "uniform, ");
@@ -826,20 +845,20 @@ print_block_kind(uint16_t kind, FILE* output)
       fprintf(output, "loop-preheader, ");
    if (kind & block_kind_loop_header)
       fprintf(output, "loop-header, ");
+   else if (kind & block_kind_loop_latch)
+      fprintf(output, "loop-latch, ");
    if (kind & block_kind_loop_exit)
       fprintf(output, "loop-exit, ");
-   if (kind & block_kind_continue)
-      fprintf(output, "continue, ");
    if (kind & block_kind_break)
       fprintf(output, "break, ");
-   if (kind & block_kind_continue_or_break)
-      fprintf(output, "continue_or_break, ");
    if (kind & block_kind_branch)
       fprintf(output, "branch, ");
    if (kind & block_kind_merge)
       fprintf(output, "merge, ");
    if (kind & block_kind_invert)
       fprintf(output, "invert, ");
+   if (kind & block_kind_discard_early_exit)
+      fprintf(output, "discard_early_exit, ");
    if (kind & block_kind_uses_discard)
       fprintf(output, "discard, ");
    if (kind & block_kind_resume)
@@ -848,6 +867,8 @@ print_block_kind(uint16_t kind, FILE* output)
       fprintf(output, "export_end, ");
    if (kind & block_kind_end_with_regs)
       fprintf(output, "end_with_regs, ");
+   if (kind & block_kind_contains_call)
+      fprintf(output, "contains_call, ");
 }
 
 static void
@@ -866,7 +887,7 @@ print_stage(Stage stage, FILE* output)
       case SWStage::TS: fprintf(output, "TS"); break;
       case SWStage::MS: fprintf(output, "MS"); break;
       case SWStage::RT: fprintf(output, "RT"); break;
-      default: unreachable("invalid SW stage");
+      default: UNREACHABLE("invalid SW stage");
       }
       if (stage.num_sw_stages() > 1)
          fprintf(output, "+");
@@ -883,16 +904,37 @@ print_stage(Stage stage, FILE* output)
    case AC_HW_NEXT_GEN_GEOMETRY_SHADER: fprintf(output, "NEXT_GEN_GEOMETRY_SHADER"); break;
    case AC_HW_PIXEL_SHADER: fprintf(output, "PIXEL_SHADER"); break;
    case AC_HW_COMPUTE_SHADER: fprintf(output, "COMPUTE_SHADER"); break;
-   default: unreachable("invalid HW stage");
+   default: UNREACHABLE("invalid HW stage");
    }
 
    fprintf(output, ")\n");
 }
 
 void
+print_debug_info(const Program* program, const Instruction* instr, FILE* output)
+{
+   fprintf(output, "// ");
+
+   assert(instr->operands[0].isConstant());
+   const auto& info = program->debug_info[instr->operands[0].constantValue()];
+   switch (info.type) {
+   case ac_shader_debug_info_src_loc:
+      if (info.src_loc.spirv_offset)
+         fprintf(output, "0x%x ", info.src_loc.spirv_offset);
+      fprintf(output, "%s:%u:%u", info.src_loc.file, info.src_loc.line, info.src_loc.column);
+      break;
+   }
+
+   fprintf(output, "\n");
+}
+
+void
 aco_print_block(enum amd_gfx_level gfx_level, const Block* block, FILE* output, unsigned flags,
                 const Program* program)
 {
+   if (block->instructions.empty() && block->linear_preds.empty())
+      return;
+
    fprintf(output, "BB%d\n", block->index);
    fprintf(output, "/* logical preds: ");
    for (unsigned pred : block->logical_preds)
@@ -916,6 +958,10 @@ aco_print_block(enum amd_gfx_level gfx_level, const Block* block, FILE* output, 
 
    for (auto const& instr : block->instructions) {
       fprintf(output, "\t");
+      if (instr->opcode == aco_opcode::p_debug_info) {
+         print_debug_info(program, instr.get(), output);
+         continue;
+      }
       if (flags & print_live_vars) {
          RegisterDemand demand = instr->register_demand;
          fprintf(output, "(%3u vgpr, %3u sgpr)   ", demand.vgpr, demand.sgpr);
@@ -923,7 +969,18 @@ aco_print_block(enum amd_gfx_level gfx_level, const Block* block, FILE* output, 
       if (flags & print_perf_info)
          fprintf(output, "(%3u clk)   ", instr->pass_flags);
 
-      aco_print_instr(gfx_level, instr.get(), output, flags);
+      if (instr->opcode == aco_opcode::p_parallelcopy &&
+          instr->definitions.size() == instr->operands.size() && instr->definitions.size() > 2) {
+         fprintf(output, "p_parallelcopy");
+         for (unsigned i = 0; i < instr->definitions.size(); i++) {
+            fprintf(output, "\n\t   ");
+            print_definition(&instr->definitions[i], output, flags);
+            fprintf(output, " = ");
+            aco_print_operand(&instr->operands[i], output, flags);
+         }
+      } else {
+         aco_print_instr(gfx_level, instr.get(), output, flags);
+      }
       fprintf(output, "\n");
    }
 }
@@ -946,14 +1003,16 @@ aco_print_operand(const Operand* operand, FILE* output, unsigned flags)
       print_reg_class(operand->regClass(), output);
       fprintf(output, "undef");
    } else {
-      if (operand->isLateKill())
-         fprintf(output, "(latekill)");
       if (operand->is16bit())
          fprintf(output, "(is16bit)");
       if (operand->is24bit())
          fprintf(output, "(is24bit)");
-      if ((flags & print_kill) && operand->isKill())
-         fprintf(output, "(kill)");
+      if ((flags & print_kill) && operand->isKill()) {
+         if (operand->isLateKill())
+            fprintf(output, "(lateKill)");
+         else
+            fprintf(output, "(kill)");
+      }
 
       if (!(flags & print_no_ssa))
          fprintf(output, "%%%d%s", operand->tempId(), operand->isFixed() ? ":" : "");
@@ -994,7 +1053,9 @@ aco_print_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* ou
 
       if (instr->opcode == aco_opcode::v_fma_mix_f32 ||
           instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
-          instr->opcode == aco_opcode::v_fma_mixhi_f16) {
+          instr->opcode == aco_opcode::v_fma_mixhi_f16 ||
+          instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz ||
+          instr->opcode == aco_opcode::p_v_fma_mixhi_f16_rtz) {
          const VALU_instruction& vop3p = instr->valu();
          abs = vop3p.abs;
          neg = vop3p.neg;
@@ -1014,14 +1075,19 @@ aco_print_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* ou
          neg = valu.neg;
          opsel = valu.opsel;
       }
+      bool is_vector_op = false;
       for (unsigned i = 0; i < num_operands; ++i) {
          if (i)
             fprintf(output, ", ");
          else
             fprintf(output, " ");
+         if (!is_vector_op && instr->operands[i].isVectorAligned())
+            fprintf(output, "(");
 
          if (i < 3) {
-            if (neg[i])
+            if (neg[i] && instr->operands[i].isConstant())
+               fprintf(output, "neg(");
+            else if (neg[i])
                fprintf(output, "-");
             if (abs[i])
                fprintf(output, "|");
@@ -1042,11 +1108,17 @@ aco_print_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* ou
             if (opsel_lo[i] || !opsel_hi[i])
                fprintf(output, ".%c%c", opsel_lo[i] ? 'y' : 'x', opsel_hi[i] ? 'y' : 'x');
 
+            if (neg[i] && instr->operands[i].isConstant())
+               fprintf(output, ")");
             if (neg_lo[i])
                fprintf(output, "*[-1,1]");
             if (neg_hi[i])
                fprintf(output, "*[1,-1]");
          }
+
+         if (is_vector_op && !instr->operands[i].isVectorAligned())
+            fprintf(output, ")");
+         is_vector_op = instr->operands[i].isVectorAligned();
       }
    }
    print_instr_format_specific(gfx_level, instr, output);
@@ -1062,6 +1134,9 @@ aco_print_program(const Program* program, FILE* output, unsigned flags)
       flags |= print_kill;
       break;
    case CompilationProgress::after_ra: fprintf(output, "After RA:\n"); break;
+   case CompilationProgress::after_lower_to_hw:
+      fprintf(output, "After lowering to hw instructions:\n");
+      break;
    }
 
    print_stage(program->stage, output);

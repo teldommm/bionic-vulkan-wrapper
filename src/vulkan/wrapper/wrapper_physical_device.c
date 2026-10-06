@@ -15,9 +15,8 @@
 #include "vk_printers.h"
 
 /* The runtime (and therefore every struct the wrapper knows how to patch)
- * is built against this header. Newer drivers (Adreno 8xx, v800+) report
- * Vulkan 1.4, whose structs this runtime does not understand, so never
- * advertise more than the header we were compiled with. */
+ * is built against this header (Mesa 26.2: Vulkan 1.4). Never advertise
+ * more than the header we were compiled with. */
 #define WRAPPER_MAX_API_VERSION VK_HEADER_VERSION_COMPLETE
 
 static uint32_t
@@ -112,7 +111,10 @@ wrapper_setup_device_extensions(struct wrapper_physical_device *pdevice) {
       }
    }
 
-   // Needed by dxvk (faked when missing, see wrapper_device.c for the stubs)
+   /* present_wait2 has the same requirements (timeline semaphores). */
+   exts->KHR_present_wait2 = exts->KHR_present_wait;
+
+   // Needed by dxvk (faked when missing, see wrapper_xfb.c for the stubs)
    exts->EXT_transform_feedback = true;
    exts->EXT_host_query_reset = true;
    exts->EXT_custom_border_color = true;
@@ -253,10 +255,18 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       WLOGD("GetPhysicalDeviceMemoryProperties:");
       LOG_STRUCT(VkPhysicalDeviceMemoryProperties, &pdevice->memory_properties);
 
+      /* Parts of the runtime read vk_physical_device::properties. */
+      pdevice->api_version_override = parse_vk_version_from_env();
+      pdevice->vk.properties.apiVersion =
+         wrapper_clamp_api_version(pdevice, pdevice->properties2.properties.apiVersion);
+      pdevice->vk.properties.driverVersion = pdevice->properties2.properties.driverVersion;
+      pdevice->vk.properties.vendorID = pdevice->properties2.properties.vendorID;
+      pdevice->vk.properties.deviceID = pdevice->properties2.properties.deviceID;
+      pdevice->vk.properties.timestampPeriod = pdevice->properties2.properties.limits.timestampPeriod;
+
       const uint32_t driver_id = pdevice->driver_properties.driverID;
       const uint32_t driver_version = pdevice->properties2.properties.driverVersion;
       pdevice->is_qcom = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
-      pdevice->api_version_override = parse_vk_version_from_env();
       pdevice->disable_placed = ENV_INT("WRAPPER_DISABLE_PLACED", 0) != 0;
       pdevice->resource_type = getenv("WRAPPER_RESOURCE_TYPE");
       if (!pdevice->resource_type || !*pdevice->resource_type)
@@ -286,6 +296,12 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       supported_features->presentWait = supported_features->timelineSemaphore &&
                                         pdevice->vk.supported_extensions.KHR_present_wait;
       supported_features->swapchainMaintenance1 = true;
+      /* VK_KHR_present_id2 / present_wait2 are implemented by the common WSI. */
+      supported_features->presentId2 = true;
+      supported_features->presentWait2 = supported_features->presentWait;
+      supported_features->presentTiming = false;
+      supported_features->presentAtAbsoluteTime = false;
+      supported_features->presentAtRelativeTime = false;
       supported_features->imageCompressionControlSwapchain = false;
 
       /* VK_EXT_map_memory_placed is emulated by the wrapper. It must be
@@ -378,9 +394,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          break;
       }
       pdevice->vk.wsi_device = &pdevice->wsi_device;
-#ifdef __TERMUX__
-      pdevice->wsi_device.wants_ahardware_buffer = true;
-#endif
+      /* AHB swapchains are selected by the X11 WSI itself on Termux builds
+       * (WSI_IMAGE_TYPE_ANDROID); nothing to request here anymore. */
 
       /* Swapchain format order: the emulator passes WRAPPER_SURFACE_FORMAT
        * matching its X server drawable (rgba8 for HAL_PIXEL_FORMAT_RGBA_8888),

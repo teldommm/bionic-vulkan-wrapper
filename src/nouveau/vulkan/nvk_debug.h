@@ -20,15 +20,43 @@ enum nvk_debug {
     */
    NVK_DEBUG_ZERO_MEMORY = 1ull << 2,
 
+   /* Write repeating nonzero patterns to client memory allocations
+    */
+   NVK_DEBUG_TRASH_MEMORY = 1ull << 3,
+
    /* Dump VM bind/unbinds
     */
-   NVK_DEBUG_VM = 1ull << 3,
+   NVK_DEBUG_VM = 1ull << 4,
 
    /* Disable most cbufs
     *
     * Root descriptors still end up in a cbuf
     */
    NVK_DEBUG_NO_CBUF = 1ull << 5,
+
+   /* Use the EXT_descriptor_buffer path for all buffer views */
+   NVK_DEBUG_FORCE_EDB_BVIEW = 1ull << 6,
+
+   /* Force all memory allocations to go to GART */
+   NVK_DEBUG_FORCE_GART = 1ull << 7,
+
+   /* Force all memory allocations to go to GART */
+   NVK_DEBUG_FORCE_COHERENT = 1ull << 8,
+
+   /* Disable image compression */
+   NVK_DEBUG_NO_COMPRESSION = 1ull << 9,
+};
+
+enum nvk_experimental {
+   /* Enable dlss support */
+   NVK_EXPERIMENTAL_DLSS = 1ull << 0,
+
+   /* Enable dlss backwards compat
+    *
+    * Allow using a SASS binary with a matching major version number, but
+    * smaller minor number than the device.
+    */
+   NVK_EXPERIMENTAL_DLSS_BACK_COMPAT = 1ull << 1,
 };
 
 #endif /* NVK_DEBUG_H */

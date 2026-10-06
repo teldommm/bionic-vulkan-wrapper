@@ -15,9 +15,12 @@ The following section describes the ABI used by non-monolithic programs.
 Registers have the following layout at the beginning of the vertex shader
 (written by the vertex prolog):
 
-* `r0-r4` and `r7` undefined. This avoids preloading into the nesting counter or
+* `r0-r3` and `r7` undefined. This avoids preloading into the nesting counter or
   having unaligned values. The prolog is free to use these registers as
   temporaries.
+* `r4` is the zero-based vertex ID if the vertex shader is running as a hardware
+  compute shader, useful to avoid a redundant special register read in the main
+  shader. Undefined in hardware vertex shaders.
 * `r5-r6` retain their usual meanings, even if the vertex shader is running as a
   hardware compute shader. This allows software index fetch code to run in the
   prolog without contaminating the main shader key.
@@ -56,7 +59,7 @@ When sample shading is enabled in a non-monolithic fragment shader, the fragment
 shader has the following register inputs:
 
 * `r0l = 0`. This is the hardware nesting counter.
-* `r0h` is the mask of samples currently being shaded. This usually equals to
+* `r1l` is the mask of samples currently being shaded. This usually equals to
   `1 << sample ID`, for "true" per-sample shading.
 
 When sample shading is disabled, no register inputs are defined. The fragment
@@ -66,7 +69,7 @@ Registers have the following layout at the end of the fragment shader (read by
 the fragment epilog):
 
 * `r0l = 0` if sample shading is enabled. This is implicitly true.
-* `r0h` preserved if sample shading is enabled.
+* `r1l` preserved if sample shading is enabled.
 * `r2` and `r3l` contain the emitted depth/stencil respectively, if
   depth and/or stencil are written by the fragment shader. Depth/stencil writes
   must be deferred to the epilog for correctness when the epilog can discard

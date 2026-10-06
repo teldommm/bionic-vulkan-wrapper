@@ -486,7 +486,7 @@ mi_value_half(struct mi_value value, bool top_32_bits)
       return value;
    }
 
-   unreachable("Invalid mi_value type");
+   UNREACHABLE("Invalid mi_value type");
 }
 
 static inline void
@@ -507,7 +507,7 @@ _mi_copy_no_unref(struct mi_builder *b,
 
    switch (dst.type) {
    case MI_VALUE_TYPE_IMM:
-      unreachable("Cannot copy to an immediate");
+      UNREACHABLE("Cannot copy to an immediate");
 
    case MI_VALUE_TYPE_MEM64:
    case MI_VALUE_TYPE_REG64:
@@ -567,7 +567,7 @@ _mi_copy_no_unref(struct mi_builder *b,
                               mi_value_half(src, true));
          break;
       default:
-         unreachable("Invalid mi_value type");
+         UNREACHABLE("Invalid mi_value type");
       }
       break;
 
@@ -598,7 +598,7 @@ _mi_copy_no_unref(struct mi_builder *b,
             mi_value_unref(b, tmp);
          }
 #else
-         unreachable("Cannot do mem <-> mem copy on IVB and earlier");
+         UNREACHABLE("Cannot do mem <-> mem copy on IVB and earlier");
 #endif
          break;
 
@@ -615,7 +615,7 @@ _mi_copy_no_unref(struct mi_builder *b,
          break;
 
       default:
-         unreachable("Invalid mi_value type");
+         UNREACHABLE("Invalid mi_value type");
       }
       break;
 
@@ -644,7 +644,7 @@ _mi_copy_no_unref(struct mi_builder *b,
             lrm.MemoryAddress = src.addr;
          }
 #else
-         unreachable("Cannot load do mem -> reg copy on SNB and earlier");
+         UNREACHABLE("Cannot load do mem -> reg copy on SNB and earlier");
 #endif
          break;
 
@@ -666,17 +666,17 @@ _mi_copy_no_unref(struct mi_builder *b,
             }
          }
 #else
-         unreachable("Cannot do reg <-> reg copy on IVB and earlier");
+         UNREACHABLE("Cannot do reg <-> reg copy on IVB and earlier");
 #endif
          break;
 
       default:
-         unreachable("Invalid mi_value type");
+         UNREACHABLE("Invalid mi_value type");
       }
       break;
 
    default:
-      unreachable("Invalid mi_value type");
+      UNREACHABLE("Invalid mi_value type");
    }
 
 
@@ -1066,6 +1066,17 @@ mi_ior(struct mi_builder *b,
                            MI_ALU_STORE, MI_ALU_ACCU);
 }
 
+static inline struct mi_value
+mi_ixor(struct mi_builder *b,
+        struct mi_value src0, struct mi_value src1)
+{
+   if (src0.type == MI_VALUE_TYPE_IMM && src1.type == MI_VALUE_TYPE_IMM)
+      return mi_imm(mi_value_to_u64(src0) ^ mi_value_to_u64(src1));
+
+   return mi_math_binop(b, MI_ALU_XOR, src0, src1,
+                           MI_ALU_STORE, MI_ALU_ACCU);
+}
+
 #if GFX_VERx10 >= 125
 static inline struct mi_value
 mi_ishl(struct mi_builder *b, struct mi_value src0, struct mi_value src1)
@@ -1290,6 +1301,40 @@ mi_udiv32_imm(struct mi_builder *b, struct mi_value N, uint32_t D)
    }
 }
 
+/* Finds the maximum between the two specified unsigned numbers. */
+static inline struct mi_value
+mi_umax2(struct mi_builder *b, struct mi_value val1, struct mi_value val2)
+{
+   /* The idea of the alrogithm here is that the value of 'mask' will be
+    * either 0 or ~0 depending on which number is bigger. Then we use AND
+    * operations to ensure the smaller value becomes zero and the bigger value
+    * is preserved, and finally OR both values to the destination (the bigger
+    * and zero).
+    *
+    * In other words:
+    *   mask = val1 < val2 ? 0xFFFFFFFF : 0x0;
+    *   biggest = (val1 & ~mask) | (val2 & mask);
+    */
+
+   /* If 'val1' is smaller, 'mask' is ~0, otherwise it's 0. */
+   struct mi_value mask = mi_ult(b, mi_value_ref(b, val1),
+                                 mi_value_ref(b, val2));
+   struct mi_value notmask = mi_ixor(b, mi_value_ref(b, mask),
+                                     mi_imm(UINT64_MAX));
+   /* If 'val1' is smaller, 'notmask' is 0, so we zero it, otherwise we
+    * preserve the value by ANDing it with ~0.
+    */
+   struct mi_value val1_or_zero = mi_iand(b, val1, notmask);
+   /* If 'val2' is smaller, mask is 0, so we zero it, otherwise we preserve
+    * the value.
+    */
+   struct mi_value val2_or_zero = mi_iand(b, val2, mask);
+   /* The smaller value was zeroed, the other was preserved, so just OR
+    * them now.
+    */
+   return mi_ior(b, val1_or_zero, val2_or_zero);
+}
+
 #endif /* MI_MATH section */
 
 /* This assumes addresses of strictly more than 32bits (aka. Gfx8+). */
@@ -1373,7 +1418,7 @@ mi_store_relocated_imm(struct mi_builder *b, struct mi_value dst)
    }
 
    default:
-      unreachable("Invalid value type");
+      UNREACHABLE("Invalid value type");
    }
 
    mi_value_unref(b, dst);
@@ -1393,7 +1438,7 @@ mi_relocate_store_imm(struct mi_reloc_imm_token token, uint64_t value)
       *token.ptr[0] = value & 0xffffffff;
       break;
    default:
-      unreachable("Invalid value type");
+      UNREACHABLE("Invalid value type");
    }
 }
 
@@ -1524,8 +1569,12 @@ mi_store_mem64_offset(struct mi_builder *b,
     */
 }
 
+#endif /* GFX_VERx10 >= 125 */
+
+#if GFX_VER >= 9
+
 /*
- * Control-flow Section.  Only available on XE_HP+
+ * Control-flow Section.  Only available on Gfx9+
  */
 
 struct _mi_goto {
@@ -1542,7 +1591,38 @@ struct mi_goto_target {
 
 #define MI_GOTO_TARGET_INIT ((struct mi_goto_target) {})
 
+/* On >= Gfx12.5, the predication of MI_BATCH_BUFFER_START is driven by the
+ * bit0 of the MI_SET_PREDICATE_RESULT register.
+ *
+ * ACM PRMs, Vol 2a: Command Reference: Instructions, MI_BATCH_BUFFER_START,
+ * Predication Enable:
+ *
+ *   "This bit is used to enable predication of this command. If this bit is
+ *    set and Bit 0 of the MI_SET_PREDICATE_RESULT register is set, this
+ *    command is ignored. Otherwise the command is performed normally."
+ *
+ * The register offset is not listed in the PRMs, but BSpec places it a
+ * 0x2418.
+ *
+ * On < Gfx12.5, the predication of MI_BATCH_BUFFER_START is driven by the
+ * bit0 of MI_PREDICATE_RESULT_1.
+ *
+ * SKL PRMs, Vol 2a: Command Reference: Instructions, MI_BATCH_BUFFER_START,
+ * Predication Enable:
+ *
+ *    "This bit is used to enable predication of this command. If this bit is
+ *     set and Bit 0 of the MI_PREDICATE_RESULT_1 register is clear, this
+ *     command is ignored. Otherwise the command is performed normally.
+ *     Specific to the Render command stream only."
+ *
+ * The register offset is listed in the SKL PRMs, Vol 2c: Command Reference:
+ * Registers, MI_PREDICATE_RESULT_1, at 0x241C.
+ */
+#if GFX_VERx10 >= 125
 #define MI_BUILDER_MI_PREDICATE_RESULT_num  0x2418
+#else
+#define MI_BUILDER_MI_PREDICATE_RESULT_num  0x241C
+#endif
 
 static inline void
 mi_goto_if(struct mi_builder *b, struct mi_value cond,
@@ -1571,11 +1651,13 @@ mi_goto_if(struct mi_builder *b, struct mi_value cond,
       predicated = true;
    }
 
+#if GFX_VERx10 >= 125
    if (predicated) {
       mi_builder_emit(b, GENX(MI_SET_PREDICATE), sp) {
          sp.PredicateEnable = NOOPOnResultClear;
       }
    }
+#endif
    if (t->placed) {
       mi_builder_emit(b, GENX(MI_BATCH_BUFFER_START), bbs) {
          bbs.PredicationEnable         = predicated;
@@ -1593,9 +1675,13 @@ mi_goto_if(struct mi_builder *b, struct mi_value cond,
       t->gotos[t->num_gotos++] = g;
    }
    if (predicated) {
+#if GFX_VERx10 >= 125
       mi_builder_emit(b, GENX(MI_SET_PREDICATE), sp) {
          sp.PredicateEnable = NOOPNever;
       }
+#else
+      mi_store(b, mi_reg32(MI_BUILDER_MI_PREDICATE_RESULT_num), mi_imm(0));
+#endif
    }
 }
 
@@ -1608,11 +1694,19 @@ mi_goto(struct mi_builder *b, struct mi_goto_target *t)
 static inline void
 mi_goto_target(struct mi_builder *b, struct mi_goto_target *t)
 {
+#if GFX_VERx10 >= 125
    mi_builder_emit(b, GENX(MI_SET_PREDICATE), sp) {
       sp.PredicateEnable = NOOPNever;
       t->addr = __gen_get_batch_address(b->user_data,
                                         mi_builder_get_inst_ptr(b));
    }
+#else
+   mi_builder_emit(b, GENX(MI_NOOP), sp) {
+      t->addr = __gen_get_batch_address(b->user_data,
+                                        mi_builder_get_inst_ptr(b));
+   }
+   mi_store(b, mi_reg32(MI_BUILDER_MI_PREDICATE_RESULT_num), mi_imm(0));
+#endif
    t->placed = true;
 
    struct GENX(MI_BATCH_BUFFER_START) bbs = { GENX(MI_BATCH_BUFFER_START_header) };
@@ -1643,6 +1737,46 @@ mi_goto_target_init_and_place(struct mi_builder *b)
 #define mi_continue(b) mi_goto(b, &__continue)
 #define mi_continue_if(b, cond) mi_goto_if(b, cond, &__continue)
 
-#endif /* GFX_VERx10 >= 125 */
+#endif /* GFX_VER >= 9 */
+
+/* Common code for drivers to set autostrip state. */
+#if INTEL_WA_14024997852_GFX_VER
+static inline void
+mi_set_autostrip_state(struct mi_builder *b, bool enable)
+{
+   struct mi_value ff_mode_reg = mi_reg32(GENX(FF_MODE_num));
+
+   uint32_t dword;
+   struct GENX(FF_MODE) ff_mode = {
+      .MeshShaderAutostripDisable = true,
+      .MeshShaderPartialAutostripDisable = true,
+      .TEAutostripDisable = true,
+   };
+   GENX(FF_MODE_pack)(NULL, &dword, &ff_mode);
+
+   /* This bit we want to always enable with Wa_14026781792. */
+   uint32_t bugfix;
+   struct GENX(FF_MODE) ff_mode_bugfix = {
+#if INTEL_NEEDS_WA_14026781792
+     .TEPatchcontrolbugfix = true,
+#endif
+   };
+   GENX(FF_MODE_pack)(NULL, &bugfix, &ff_mode_bugfix);
+
+   if (!enable) {
+      /* Enable flags. */
+      mi_store(b, ff_mode_reg,
+               mi_ior(b,
+                      mi_imm(bugfix),
+                      mi_ior(b, ff_mode_reg, mi_imm(dword))));
+   } else {
+      /* Disable flags. */
+      mi_store(b, ff_mode_reg,
+               mi_ior(b,
+                      mi_imm(bugfix),
+                      mi_iand(b, ff_mode_reg, mi_imm(~dword))));
+   }
+}
+#endif
 
 #endif /* MI_BUILDER_H */

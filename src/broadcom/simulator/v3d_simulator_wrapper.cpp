@@ -27,8 +27,6 @@
  * v3d_simulator.c code to use.
  */
 
-#ifdef USE_V3D_SIMULATOR
-
 #include "v3d_simulator_wrapper.h"
 #include "v3d_hw_auto.h"
 
@@ -91,6 +89,13 @@ int v3d_hw_get_version(struct v3d_hw *hw)
         return ident->tech_version * 10 + ident->revision;
 }
 
+int v3d_hw_get_revision(struct v3d_hw *hw)
+{
+   const V3D_HUB_IDENT_T *ident = hw->get_hub_ident();
+
+   return ident->sub_rev;
+}
+
 void
 v3d_hw_set_isr(struct v3d_hw *hw, void (*isr)(uint32_t status))
 {
@@ -103,4 +108,3 @@ uint32_t v3d_hw_get_hub_core()
 }
 
 }
-#endif /* USE_V3D_SIMULATOR */

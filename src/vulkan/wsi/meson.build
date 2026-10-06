@@ -10,20 +10,25 @@ if dep_libdrm.found()
 endif
 
 if with_wrapper_vk
-  files_vulkan_wsi += files('wsi_common_ahardware_buffer.c')
+  files_vulkan_wsi += files('wsi_common_android.c')
 endif
 
 if with_platform_x11
   files_vulkan_wsi += files('wsi_common_x11.c')
+  links_vulkan_wsi += libloader_x11
+  links_vulkan_wsi += libloader
 endif
 
 if with_platform_wayland
   files_vulkan_wsi += files('wsi_common_wayland.c')
+  files_vulkan_wsi += wp_files['fifo-v1']
+  files_vulkan_wsi += wp_files['commit-timing-v1']
   files_vulkan_wsi += wp_files['linux-dmabuf-unstable-v1']
   files_vulkan_wsi += wp_files['presentation-time']
   files_vulkan_wsi += wp_files['tearing-control-v1']
   links_vulkan_wsi += libloader_wayland_helper
   files_vulkan_wsi += wp_files['linux-drm-syncobj-v1']
+  files_vulkan_wsi += wp_files['color-management-v1']
 endif
 
 if with_platform_windows
@@ -31,6 +36,10 @@ if with_platform_windows
   platform_deps += dep_dxheaders
 else
   files_vulkan_wsi += files('wsi_common_headless.c')
+endif
+
+if with_platform_macos
+  files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
 endif
 
 if system_has_kms_drm and not with_platform_android

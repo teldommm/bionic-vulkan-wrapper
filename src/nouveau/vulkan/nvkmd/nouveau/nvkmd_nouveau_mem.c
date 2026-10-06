@@ -28,10 +28,11 @@ create_mem_or_close_bo(struct nvkmd_nouveau_dev *dev,
                        enum nvkmd_mem_flags mem_flags,
                        struct nouveau_ws_bo *bo,
                        enum nvkmd_va_flags va_flags,
-                       uint8_t pte_kind, uint64_t va_align_B,
+                       uint64_t va_align_B,
                        struct nvkmd_mem **mem_out)
 {
    const uint64_t size_B = bo->size;
+   const uint8_t pte_kind = bo->pte_kind;
    VkResult result;
 
    struct nvkmd_nouveau_mem *mem = CALLOC_STRUCT(nvkmd_nouveau_mem);
@@ -40,12 +41,16 @@ create_mem_or_close_bo(struct nvkmd_nouveau_dev *dev,
       goto fail_bo;
    }
 
-   mem->base.ops = &nvkmd_nouveau_mem_ops;
-   mem->base.dev = &dev->base;
-   mem->base.refcnt = 1;
-   mem->base.flags = mem_flags;
-   mem->base.bind_align_B = dev->base.pdev->bind_align_B;
-   mem->base.size_B = size_B;
+   /* It should be the caller's responsibility to ensure proper alignment and
+    * this function should be kept pretty simple. However, because dma_buf
+    * imports call this with 0 alignment, we need a minimum alignment for the
+    * memory object initialization. For other cases, we just pass in the given
+    * alignment along the chain. There's no need to re-align here because the
+    * VA allocation at the end aligns the data to va_align_B.
+    */
+   va_align_B = MAX2(dev->base.pdev->bind_align_B, va_align_B);
+   nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_nouveau_mem_ops,
+                  mem_flags, size_B, va_align_B);
    mem->bo = bo;
 
    result = nvkmd_dev_alloc_va(&dev->base, log_obj,
@@ -75,6 +80,28 @@ fail_bo:
    return result;
 }
 
+static inline bool
+force_mem_to_gart(const struct nvkmd_pdev *pdev,
+                  enum nvkmd_mem_flags flags)
+{
+   if (pdev->debug_flags & NVK_DEBUG_FORCE_GART)
+      return true;
+
+   /* TODO:
+    *
+    * VRAM maps on Kepler appear to be broken and we don't really know why.
+    * My NVIDIA contact doesn't remember them not working so they probably
+    * should but they don't today.  Force everything that may be mapped to
+    * use GART for now.
+    */
+   if (pdev->dev_info.chipset < 0x110 && (flags & NVKMD_MEM_CAN_MAP)) {
+      assert(!(flags & NVKMD_MEM_VRAM));
+      return true;
+   }
+
+   return false;
+}
+
 VkResult
 nvkmd_nouveau_alloc_tiled_mem(struct nvkmd_dev *_dev,
                               struct vk_object_base *log_obj,
@@ -101,23 +128,16 @@ nvkmd_nouveau_alloc_tiled_mem(struct nvkmd_dev *_dev,
       domains |= NOUVEAU_WS_BO_VRAM;
    }
 
-   /* TODO:
-    *
-    * VRAM maps on Kepler appear to be broken and we don't really know why.
-    * My NVIDIA contact doesn't remember them not working so they probably
-    * should but they don't today.  Force everything that may be mapped to
-    * use GART for now.
-    */
-   if (dev_info->chipset < 0x110 && (flags & NOUVEAU_WS_BO_MAP)) {
-      assert(domains & NOUVEAU_WS_BO_GART);
+   if (force_mem_to_gart(dev->base.pdev, flags))
       domains = NOUVEAU_WS_BO_GART;
-   }
 
-   const uint32_t mem_align_B = _dev->pdev->bind_align_B;
-   size_B = align64(size_B, mem_align_B);
-
+   /* Since not all callers care about the alignment and pass in zero to signal
+    * that, we enforce a minimum alignment equal to the system page size here,
+    * which is guaranteed to work.
+    */
    assert(util_is_power_of_two_or_zero64(align_B));
-   const uint64_t va_align_B = MAX2(mem_align_B, align_B);
+   align_B = MAX2(align_B, dev->base.pdev->bind_align_B);
+   size_B = align64(size_B, align_B);
 
    enum nouveau_ws_bo_flags nouveau_flags = domains;
    if (flags & NVKMD_MEM_CAN_MAP)
@@ -125,8 +145,24 @@ nvkmd_nouveau_alloc_tiled_mem(struct nvkmd_dev *_dev,
    if (!(flags & NVKMD_MEM_SHARED))
       nouveau_flags |= NOUVEAU_WS_BO_NO_SHARE;
 
+   if (dev->base.pdev->dev_info.type == NV_DEVICE_TYPE_SOC) {
+      if (dev->base.pdev->debug_flags & NVK_DEBUG_FORCE_COHERENT)
+         flags |= NVKMD_MEM_COHERENT;
+
+      /* On Tegra, we have to explicitly request coherent maps by putting the
+       * BO in NOUVEAU_GEM_DOMAIN_COHERENT.
+       */
+      if (flags & NVKMD_MEM_COHERENT)
+         nouveau_flags |= NOUVEAU_WS_BO_COHERENT;
+   } else {
+      /* We assume that all discrete GPU maps are coherent.  They're either
+       * CPU memory or WB VRAM maps.
+       */
+      flags |= NVKMD_MEM_COHERENT;
+   }
+
    struct nouveau_ws_bo *bo = nouveau_ws_bo_new_tiled(dev->ws_dev,
-                                                      size_B, mem_align_B,
+                                                      size_B, align_B,
                                                       pte_kind, tile_mode,
                                                       nouveau_flags);
    if (bo == NULL)
@@ -137,8 +173,7 @@ nvkmd_nouveau_alloc_tiled_mem(struct nvkmd_dev *_dev,
       va_flags |= NVKMD_VA_GART;
 
    return create_mem_or_close_bo(dev, log_obj, flags, bo,
-                                 va_flags, pte_kind, va_align_B,
-                                 mem_out);
+                                 va_flags, align_B, mem_out);
 }
 
 VkResult
@@ -162,9 +197,16 @@ nvkmd_nouveau_import_dma_buf(struct nvkmd_dev *_dev,
    if (bo->flags & NOUVEAU_WS_BO_MAP)
       flags |= NVKMD_MEM_CAN_MAP;
 
+   /* We assume that all discrete GPU maps are coherent.  They're either CPU
+    * memory or WB VRAM maps.  On Tegra, maps are only coherent if the BO is
+    * in NOUVEAU_GEM_DOMAIN_COHERENT.
+    */
+   if ((bo->flags & NOUVEAU_WS_BO_COHERENT) ||
+       dev->base.pdev->dev_info.type != NV_DEVICE_TYPE_SOC)
+      flags |= NVKMD_MEM_COHERENT;
+
    return create_mem_or_close_bo(dev, log_obj, flags, bo,
                                  0 /* va_flags */,
-                                 0 /* pte_kind */,
                                  0 /* va_align_B */,
                                  mem_out);
 }
@@ -183,12 +225,11 @@ static VkResult
 nvkmd_nouveau_mem_map(struct nvkmd_mem *_mem,
                       struct vk_object_base *log_obj,
                       enum nvkmd_mem_map_flags map_flags,
-                      void *fixed_addr)
+                      void *fixed_addr,
+                      void **map_out)
 {
    struct nvkmd_nouveau_mem *mem = nvkmd_nouveau_mem(_mem);
    struct nvkmd_nouveau_dev *dev = nvkmd_nouveau_dev(_mem->dev);
-
-   assert((fixed_addr == NULL) == !(map_flags & NVKMD_MEM_MAP_FIXED));
 
    int prot = 0;
    if (map_flags & NVKMD_MEM_MAP_RD)
@@ -205,35 +246,37 @@ nvkmd_nouveau_mem_map(struct nvkmd_mem *_mem,
    if (map == MAP_FAILED)
       return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
 
-   mem->base.map = map;
+   *map_out = map;
 
    return VK_SUCCESS;
 }
 
 static void
-nvkmd_nouveau_mem_unmap(struct nvkmd_mem *_mem)
+nvkmd_nouveau_mem_unmap(struct nvkmd_mem *_mem,
+                        enum nvkmd_mem_map_flags flags,
+                        void *map)
 {
    struct nvkmd_nouveau_mem *mem = nvkmd_nouveau_mem(_mem);
 
-   munmap(mem->base.map, mem->base.size_B);
-   mem->base.map = NULL;
+   munmap(map, mem->base.size_B);
 }
 
 static VkResult
 nvkmd_nouveau_mem_overmap(struct nvkmd_mem *_mem,
-                          struct vk_object_base *log_obj)
+                          struct vk_object_base *log_obj,
+                          enum nvkmd_mem_map_flags flags,
+                          void *map)
 {
    struct nvkmd_nouveau_mem *mem = nvkmd_nouveau_mem(_mem);
 
-   void *map = mmap(mem->base.map, mem->base.size_B, PROT_NONE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-   if (map == MAP_FAILED) {
+   void *new_map = mmap(map, mem->base.size_B, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+   if (new_map == MAP_FAILED) {
       return vk_errorf(log_obj, VK_ERROR_MEMORY_MAP_FAILED,
                        "Failed to map over original mapping");
    }
 
-   assert(map == mem->base.map);
-   mem->base.map = NULL;
+   assert(new_map == map);
 
    return VK_SUCCESS;
 }
