@@ -20,6 +20,7 @@
 #include "wrapper_entrypoints.h"
 #include "wrapper_trampolines.h"
 #include "wrapper_checks.h"
+#include "vk_printers.h"
 #include "vk_util.h"
 #include "util/hash_table.h"
 
