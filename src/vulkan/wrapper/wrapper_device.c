@@ -2057,26 +2057,29 @@ wrapper_patch_spirv(struct wrapper_device *wdev,
 
    if (needs_spec_composite_constants_emulation) {
       SpirvCode lowered = { 0 };
-      if (fix_mali_spec_composite_constants(cur, cur_words, &lowered))
+      if (fix_mali_spec_composite_constants(cur, cur_words, &lowered)) {
          WLOGE("fix_mali_spec_composite_constants failed");
-      else
+      } else {
          REPLACE(lowered.spirv_code, lowered.spirv_word_count);
+      }
    }
 
    if (needs_optimization_barriers) {
       SpirvCode lowered = { 0 };
-      if (add_optimization_barriers(cur, cur_words, &lowered))
+      if (add_optimization_barriers(cur, cur_words, &lowered)) {
          WLOGE("add_optimization_barriers failed");
-      else
+      } else {
          REPLACE(lowered.spirv_code, lowered.spirv_word_count);
+      }
    }
 
    if (needs_clip_distance_emulation) {
       SpirvCode lowered = { 0 };
-      if (lower_eliminate_clip_distance(cur, cur_words, &lowered))
+      if (lower_eliminate_clip_distance(cur, cur_words, &lowered)) {
          WLOGE("lower_eliminate_clip_distance failed");
-      else
+      } else {
          REPLACE(lowered.spirv_code, lowered.spirv_word_count);
+      }
    }
 #undef REPLACE
 
